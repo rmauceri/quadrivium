@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Quadrivium</title>
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; overscroll-behavior: none; background: #1c1917; }
+canvas { display: block; touch-action: none; }
+#overlay {
+  position: fixed; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+  opacity: 1; transition: opacity 1.8s ease-out;
+}
+#overlay.hidden { opacity: 0; }
+#overlay span {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: clamp(0.9rem, 2.5vw, 1.3rem);
+  color: rgba(200, 190, 170, 0.35);
+  letter-spacing: 0.25em;
+  text-transform: lowercase;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay"><span>touch to begin</span></div>
+
+<script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js"></script>
+<script>
+'use strict';
+
+/* =============================================================
+   CONSTANTS & CONFIG
+   ============================================================= */
+
+const BG = '#1c1917';
+
+// A minor pentatonic — 3 octaves
+const SCALE = [
+  110.00, 130.81, 146.83, 164.81, 196.00,
+  220.00, 261.63, 293.66, 329.63, 392.00,
+  440.00, 523.25, 587.33, 659.26, 783.99,
+  880.00
+];
+
+const SHAPE_DEFS = {
+  circle:   { color: [200,160,80],  breath: 'pulse',  bRate: 0.30, bAmt: 0.030, rough: 1.5, fill: 'hachure',     hAng: -41, hGap: 5 },
+  triangle: { color: [200,110,110], breath: 'wobble', bRate: 0.25, bAmt: 0.035, rough: 1.8, fill: 'cross-hatch', hAng:  60, hGap: 6 },
+  square:   { color: [100,130,170], breath: 'throb',  bRate: 0.45, bAmt: 0.025, rough: 1.2, fill: 'hachure',     hAng:   0, hGap: 5 },
+  pentagon: { color: [150,115,180], breath: 'drift',  bRate: 0.05, bAmt: 0.10,  rough: 1.6, fill: 'hachure',     hAng:  30, hGap: 5 },
+};
+
+const TYPES       = Object.keys(SHAPE_DEFS);
+const BASE_SIZE   = 0.065;
+const SIZE_VARY   = 0.012;
+const PAL_SCALE   = 0.55;
+const PAL_Y       = 0.93;
+const PAL_ZONE    = 0.87;
+const PROX_FRAC   = 0.28;
+const MIN_HIT     = 44;
+const DBL_TAP_MS  = 350;
+const DOT_SP      = 0.03;
+const DOT_ALPHA   = 0.035;
+
+/* =============================================================
+   STATE
+   ============================================================= */
+
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+let rc;
+let W, H, unit;
+
+let shapes   = [];
+let palette  = [];
+let drag     = null;
+let audioOK  = false;
+let tapTime  = 0, tapId = -1;
+let proxPairs = [];
+let nextId   = 1;
+
+let grainCvs, tableCvs;
+let masterComp, masterVerb;
+
+/* =============================================================
+   UTILITY
+   ============================================================= */
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function pitchFromY(y) {
+  const t = 1 - clamp(y, 0, 1);
+  return SCALE[Math.round(t * (SCALE.length - 1))];
+}
+
+function volFromSize(sz) {
+  const t = clamp((sz - 0.04) / 0.04, 0, 1);
+  return -28 + t * 8;
+}
+
+function pxDist(a, b) {
+  const dx = (a.x - b.x) * W, dy = (a.y - b.y) * H;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+/* =============================================================
+   AUDIO ENGINE
+   ============================================================= */
+
+async function startAudio() {
+  if (audioOK) return;
+  audioOK = true;
+  document.getElementById('overlay').classList.add('hidden');
+
+  await Tone.start();
+
+  masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 }).toDestination();
+  masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterVerb);
+  await masterVerb.ready;
+
+  shapes.forEach(s => attachSynth(s));
+  recomputeProximity();
+}
+
+function attachSynth(shape) {
+  if (shape.synth || shape.isPalette) return;
+  let synth, extras = [];
+
+  switch (shape.type) {
+    case 'circle': {
+      synth = new Tone.Synth({
+        oscillator: { type: 'sine' },
+        envelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
+      });
+      const tr = new Tone.Tremolo({ frequency: 0.15, depth: 0.12 }).start();
+      extras.push(tr);
+      synth.chain(tr, masterComp);
+      break;
+    }
+    case 'triangle': {
+      synth = new Tone.FMSynth({
+        harmonicity: 2, modulationIndex: 0.9,
+        oscillator: { type: 'sine' }, modulation: { type: 'sine' },
+        envelope: { attack: 2, decay: 0, sustain: 1, release: 2 },
+        modulationEnvelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
+      });
+      synth.connect(masterComp);
+      break;
+    }
+    case 'square': {
+      synth = new Tone.Synth({
+        oscillator: { type: 'square' },
+        envelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
+      });
+      const f = new Tone.Filter({ frequency: 700, type: 'lowpass', rolloff: -12 });
+      const tr = new Tone.Tremolo({ frequency: 0.35, depth: 0.28 }).start();
+      extras.push(f, tr);
+      synth.chain(f, tr, masterComp);
+      break;
+    }
+    case 'pentagon': {
+      synth = new Tone.Synth({
+        oscillator: { type: 'fatsine', count: 3, spread: 28 },
+        envelope: { attack: 3, decay: 0, sustain: 1, release: 3 }
+      });
+      synth.connect(masterComp);
+      break;
+    }
+  }
+
+  shape.synth  = synth;
+  shape.extras = extras;
+  synth.volume.value = volFromSize(shape.size);
+  synth.triggerAttack(pitchFromY(shape.y));
+}
+
+function detachSynth(shape) {
+  if (!shape.synth) return;
+  const s = shape.synth, ex = shape.extras || [];
+  shape.synth = null; shape.extras = [];
+  s.volume.rampTo(-60, 0.6);
+  setTimeout(() => {
+    try { s.triggerRelease(); } catch(_){}
+    setTimeout(() => {
+      try { s.dispose(); } catch(_){}
+      ex.forEach(e => { try { e.dispose(); } catch(_){} });
+    }, 3500);
+  }, 650);
+}
+
+function updateShapeAudio(shape) {
+  if (!shape.synth) return;
+  shape.synth.frequency.rampTo(pitchFromY(shape.y), 0.12);
+}
+
+function applyProximityAudio() {
+  shapes.forEach(s => {
+    if (!s.synth) return;
+    const base  = volFromSize(s.size);
+    const boost = Math.min(s.proxBoost || 0, 6);
+    s.synth.volume.rampTo(base + boost, 0.25);
+  });
+}
+
+/* =============================================================
+   PROXIMITY
+   ============================================================= */
+
+function recomputeProximity() {
+  const diag = Math.sqrt(W * W + H * H);
+  const thresh = PROX_FRAC * diag;
+  proxPairs = [];
+  shapes.forEach(s => s.proxBoost = 0);
+
+  for (let i = 0; i < shapes.length; i++) {
+    for (let j = i + 1; j < shapes.length; j++) {
+      const d = pxDist(shapes[i], shapes[j]);
+      if (d < thresh) {
+        const str = 1 - d / thresh;
+        proxPairs.push({ a: shapes[i], b: shapes[j], strength: str });
+        shapes[i].proxBoost += str * 3.5;
+        shapes[j].proxBoost += str * 3.5;
+      }
+    }
+  }
+
+  if (audioOK) applyProximityAudio();
+}
+
+function drawProximityLines() {
+  proxPairs.forEach(({ a, b, strength }) => {
+    const alpha = strength * 0.22;
+    if (alpha < 0.01) return;
+    rc.line(a.x * W, a.y * H, b.x * W, b.y * H, {
+      stroke: `rgba(200,190,170,${alpha})`,
+      strokeWidth: 0.4 + strength * 1.2,
+      roughness: 2.5,
+      seed: a.seed ^ b.seed,
+    });
+  });
+}
+
+/* =============================================================
+   SHAPE SYSTEM
+   ============================================================= */
+
+function makeShape(type, x, y, asPalette) {
+  const def = SHAPE_DEFS[type];
+  const [cr, cg, cb] = def.color;
+  const v = asPalette ? 0 : 18;
+  return {
+    id: nextId++, type, x, y,
+    size: asPalette ? BASE_SIZE * PAL_SCALE : BASE_SIZE + (Math.random() - 0.5) * SIZE_VARY * 2,
+    rgb: [
+      clamp(Math.round(cr + (Math.random() - 0.5) * v), 0, 255),
+      clamp(Math.round(cg + (Math.random() - 0.5) * v), 0, 255),
+      clamp(Math.round(cb + (Math.random() - 0.5) * v), 0, 255),
+    ],
+    phase: Math.random() * Math.PI * 2,
+    seed: Math.floor(Math.random() * 1e6),
+    synth: null, extras: [],
+    opacity: asPalette ? 0.30 : 1,
+    isPalette: !!asPalette,
+    proxBoost: 0,
+    _cache: null, _dirty: true,
+  };
+}
+
+function cacheShape(shape) {
+  const px = Math.ceil(shape.size * unit * 1.8);
+  if (px < 4) return;
+
+  const c = document.createElement('canvas');
+  c.width = c.height = px;
+  const crc = rough.canvas(c);
+  const mid = px / 2, sz = shape.size * unit;
+  const [r, g, b] = shape.rgb;
+  const sa = shape.isPalette ? 0.45 : 0.8;
+  const fa = shape.isPalette ? 0.05 : 0.12;
+
+  const opts = {
+    stroke: `rgba(${r},${g},${b},${sa})`,
+    strokeWidth: shape.isPalette ? 1 : 1.5,
+    roughness: SHAPE_DEFS[shape.type].rough,
+    fill: `rgba(${r},${g},${b},${fa})`,
+    fillStyle: SHAPE_DEFS[shape.type].fill,
+    fillWeight: 0.5,
+    hachureAngle: SHAPE_DEFS[shape.type].hAng,
+    hachureGap: Math.max(3, SHAPE_DEFS[shape.type].hGap * (unit / 700)),
+    seed: shape.seed,
+  };
+
+  switch (shape.type) {
+    case 'circle':
+      crc.circle(mid, mid, sz, opts);
+      break;
+    case 'triangle': {
+      const h = sz * 0.866;
+      crc.polygon([
+        [mid, mid - h * 0.55],
+        [mid - sz * 0.5, mid + h * 0.45],
+        [mid + sz * 0.5, mid + h * 0.45],
+      ], opts);
+      break;
+    }
+    case 'square':
+      crc.rectangle(mid - sz * 0.45, mid - sz * 0.45, sz * 0.9, sz * 0.9, opts);
+      break;
+    case 'pentagon': {
+      const pts = [];
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2 - Math.PI / 2;
+        pts.push([mid + Math.cos(a) * sz * 0.48, mid + Math.sin(a) * sz * 0.48]);
+      }
+      crc.polygon(pts, opts);
+      break;
+    }
+  }
+
+  // Construction mark: center dot
+  const cc = c.getContext('2d');
+  cc.fillStyle = `rgba(${r},${g},${b},${shape.isPalette ? 0.08 : 0.18})`;
+  cc.beginPath();
+  cc.arc(mid, mid, Math.max(1.5, unit * 0.003), 0, Math.PI * 2);
+  cc.fill();
+
+  shape._cache = c;
+  shape._dirty = false;
+}
+
+function drawShape(shape, time) {
+  if (shape._dirty || !shape._cache) cacheShape(shape);
+  if (!shape._cache) return;
+
+  const def = SHAPE_DEFS[shape.type];
+  const t = time * 0.001;
+  const bp = t * def.bRate * Math.PI * 2 + shape.phase;
+  let sc = 1, rot = 0;
+
+  switch (def.breath) {
+    case 'pulse': sc  = 1 + Math.sin(bp) * def.bAmt; break;
+    case 'wobble': rot = Math.sin(bp) * def.bAmt; break;
+    case 'throb': sc   = 1 + Math.sin(bp) * def.bAmt; break;
+    case 'drift': rot  = bp * def.bAmt; break;
+  }
+
+  // Lift when dragging
+  if (drag && drag.shape === shape) sc *= 1.1;
+
+  // Glow when proximate
+  const glow = Math.min((shape.proxBoost || 0) / 4, 0.5);
+
+  ctx.save();
+  ctx.globalAlpha = shape.opacity;
+  ctx.translate(shape.x * W, shape.y * H);
+  ctx.rotate(rot);
+  ctx.scale(sc, sc);
+
+  // Subtle proximity glow halo
+  if (glow > 0.02 && !shape.isPalette) {
+    const [r, g, b] = shape.rgb;
+    const grad = ctx.createRadialGradient(0, 0, 0, 0, 0, shape._cache.width * 0.6);
+    grad.addColorStop(0, `rgba(${r},${g},${b},${glow * 0.15})`);
+    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(0, 0, shape._cache.width * 0.6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.drawImage(shape._cache, -shape._cache.width / 2, -shape._cache.height / 2);
+  ctx.restore();
+}
+
+function removeShape(shape) {
+  const idx = shapes.indexOf(shape);
+  if (idx >= 0) shapes.splice(idx, 1);
+  detachSynth(shape);
+  recomputeProximity();
+}
+
+/* =============================================================
+   DRAFTING TABLE
+   ============================================================= */
+
+function buildGrain() {
+  grainCvs = document.createElement('canvas');
+  grainCvs.width = W; grainCvs.height = H;
+  const gc = grainCvs.getContext('2d');
+  const img = gc.createImageData(W, H);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const v = Math.random() * 255;
+    d[i] = d[i+1] = d[i+2] = v;
+    d[i+3] = Math.random() * 14;
+  }
+  gc.putImageData(img, 0, 0);
+}
+
+function buildTable() {
+  tableCvs = document.createElement('canvas');
+  tableCvs.width = W; tableCvs.height = H;
+  const tc = tableCvs.getContext('2d');
+  const trc = rough.canvas(tableCvs);
+
+  // Dot grid
+  const sp = DOT_SP * unit;
+  const dr = Math.max(0.8, unit * 0.0018);
+  tc.fillStyle = `rgba(180,170,155,${DOT_ALPHA})`;
+  for (let x = sp; x < W; x += sp)
+    for (let y = sp; y < H * PAL_ZONE; y += sp) {
+      tc.beginPath(); tc.arc(x, y, dr, 0, Math.PI * 2); tc.fill();
+    }
+
+  // Palette shelf
+  const g = tc.createLinearGradient(0, H * 0.86, 0, H);
+  g.addColorStop(0, 'rgba(180,170,155,0)');
+  g.addColorStop(0.4, 'rgba(180,170,155,0.015)');
+  g.addColorStop(1, 'rgba(180,170,155,0.025)');
+  tc.fillStyle = g;
+  tc.fillRect(0, H * 0.86, W, H * 0.14);
+
+  // Thin shelf divider
+  trc.line(W * 0.08, H * PAL_ZONE + H * 0.005, W * 0.92, H * PAL_ZONE + H * 0.005, {
+    stroke: 'rgba(180,170,155,0.06)', strokeWidth: 0.5, roughness: 2, seed: 9999
+  });
+
+  // Compass rose — upper-left
+  const cx = unit * 0.06, cy = unit * 0.06, sz = unit * 0.032;
+  const cc = 'rgba(180,170,155,0.07)';
+  const lo = { stroke: cc, strokeWidth: 0.6, roughness: 1.5, seed: 7777 };
+  trc.line(cx, cy - sz, cx, cy + sz, lo);
+  trc.line(cx - sz, cy, cx + sz, cy, lo);
+  const d2 = sz * 0.55;
+  trc.line(cx - d2, cy - d2, cx + d2, cy + d2, lo);
+  trc.line(cx + d2, cy - d2, cx - d2, cy + d2, lo);
+  trc.circle(cx, cy, sz * 0.2, { ...lo, fill: cc, fillStyle: 'solid' });
+  tc.font = `${Math.max(8, sz * 0.35)}px Georgia`;
+  tc.fillStyle = cc; tc.textAlign = 'center';
+  tc.fillText('N', cx, cy - sz - 3);
+
+  // Smudge marks
+  [[0.72, 0.30, 0.07], [0.18, 0.58, 0.045], [0.85, 0.70, 0.035]].forEach(([sx, sy, sr]) => {
+    const gr = tc.createRadialGradient(sx * W, sy * H, 0, sx * W, sy * H, sr * unit);
+    gr.addColorStop(0, 'rgba(45,38,32,0.05)');
+    gr.addColorStop(1, 'rgba(45,38,32,0)');
+    tc.fillStyle = gr;
+    tc.beginPath();
+    tc.ellipse(sx * W, sy * H, sr * unit, sr * unit * 0.6, sx * 3, 0, Math.PI * 2);
+    tc.fill();
+  });
+}
+
+/* =============================================================
+   INTERACTION
+   ============================================================= */
+
+function hitTest(px, py) {
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    const s = shapes[i];
+    const dx = px - s.x * W, dy = py - s.y * H;
+    const hr = Math.max(s.size * unit * 0.55, MIN_HIT);
+    if (dx * dx + dy * dy < hr * hr) return { shape: s, from: 'shape' };
+  }
+  for (let i = palette.length - 1; i >= 0; i--) {
+    const s = palette[i];
+    const dx = px - s.x * W, dy = py - s.y * H;
+    const hr = Math.max(s.size * unit * 0.55, MIN_HIT);
+    if (dx * dx + dy * dy < hr * hr) return { shape: s, from: 'palette' };
+  }
+  return null;
+}
+
+function onDown(e) {
+  e.preventDefault();
+  cvs.setPointerCapture(e.pointerId);
+
+  if (!audioOK) { startAudio(); return; }
+
+  const px = e.clientX, py = e.clientY;
+  const hit = hitTest(px, py);
+
+  // Double-tap → remove
+  if (hit && hit.from === 'shape') {
+    const now = performance.now();
+    if (tapId === hit.shape.id && now - tapTime < DBL_TAP_MS) {
+      removeShape(hit.shape);
+      tapId = -1;
+      return;
+    }
+    tapTime = now;
+    tapId = hit.shape.id;
+  }
+
+  if (!hit) return;
+
+  if (hit.from === 'palette') {
+    const tmpl = hit.shape;
+    const ns = makeShape(tmpl.type, tmpl.x, tmpl.y, false);
+    shapes.push(ns);
+    if (audioOK) attachSynth(ns);
+    drag = { shape: ns, ox: 0, oy: 0, fromPal: true };
+  } else {
+    drag = {
+      shape: hit.shape,
+      ox: hit.shape.x - px / W,
+      oy: hit.shape.y - py / H,
+      fromPal: false
+    };
+    // Raise to top
+    const idx = shapes.indexOf(hit.shape);
+    if (idx >= 0) { shapes.splice(idx, 1); shapes.push(hit.shape); }
+  }
+}
+
+function onMove(e) {
+  if (!drag) return;
+  e.preventDefault();
+  const s = drag.shape;
+  s.x = clamp(e.clientX / W + drag.ox, 0.03, 0.97);
+  s.y = clamp(e.clientY / H + drag.oy, 0.03, 0.97);
+
+  updateShapeAudio(s);
+  recomputeProximity();
+}
+
+function onUp(e) {
+  if (!drag) return;
+  const s = drag.shape;
+
+  // Remove if dropped into palette zone (unless freshly created from palette and not moved up)
+  if (drag.fromPal && s.y > PAL_ZONE - 0.03) {
+    removeShape(s);
+  } else if (!drag.fromPal && s.y > PAL_ZONE + 0.02) {
+    removeShape(s);
+  }
+
+  drag = null;
+}
+
+cvs.addEventListener('pointerdown', onDown);
+cvs.addEventListener('pointermove', onMove);
+cvs.addEventListener('pointerup', onUp);
+cvs.addEventListener('pointercancel', () => { drag = null; });
+
+/* =============================================================
+   SCENE DRAWING
+   ============================================================= */
+
+function draw(time) {
+  requestAnimationFrame(draw);
+
+  // Background
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, W, H);
+
+  // Static table surface
+  if (tableCvs) ctx.drawImage(tableCvs, 0, 0);
+
+  // Proximity lines
+  drawProximityLines();
+
+  // Shapes — z-sort by y (lower y = further back = drawn first)
+  const sorted = [...shapes].sort((a, b) => a.y - b.y);
+  sorted.forEach(s => drawShape(s, time));
+
+  // Palette shapes
+  palette.forEach(s => drawShape(s, time));
+
+  // Grain overlay
+  if (grainCvs) {
+    ctx.globalAlpha = 0.055;
+    ctx.drawImage(grainCvs, 0, 0);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* =============================================================
+   INIT
+   ============================================================= */
+
+function initPalette() {
+  palette = [];
+  const count = TYPES.length;
+  const spacing = Math.min(0.18, 0.7 / count);
+  const startX = 0.5 - (count - 1) * spacing / 2;
+  TYPES.forEach((t, i) => {
+    palette.push(makeShape(t, startX + i * spacing, PAL_Y, true));
+  });
+}
+
+function initScene() {
+  shapes = [];
+  // Three shapes: circle + triangle close together, pentagon alone
+  shapes.push(makeShape('circle',   0.32 + Math.random() * 0.03, 0.38 + Math.random() * 0.03, false));
+  shapes.push(makeShape('triangle', 0.52 + Math.random() * 0.03, 0.33 + Math.random() * 0.03, false));
+  shapes.push(makeShape('pentagon', 0.70 + Math.random() * 0.03, 0.62 + Math.random() * 0.03, false));
+  recomputeProximity();
+}
+
+function resize() {
+  W = cvs.width  = window.innerWidth;
+  H = cvs.height = window.innerHeight;
+  unit = Math.min(W, H);
+  rc = rough.canvas(cvs);
+
+  buildGrain();
+  buildTable();
+  [...shapes, ...palette].forEach(s => { s._dirty = true; });
+}
+
+window.addEventListener('resize', resize);
+resize();
+initPalette();
+initScene();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
