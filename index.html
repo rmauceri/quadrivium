@@ -48,10 +48,11 @@ const SCALE = [
 ];
 
 const SHAPE_DEFS = {
-  circle:   { color: [200,160,80],  breath: 'pulse',  bRate: 0.30, bAmt: 0.030, rough: 1.5, fill: 'hachure',     hAng: -41, hGap: 5 },
-  triangle: { color: [200,110,110], breath: 'wobble', bRate: 0.25, bAmt: 0.035, rough: 1.8, fill: 'cross-hatch', hAng:  60, hGap: 6 },
-  square:   { color: [100,130,170], breath: 'throb',  bRate: 0.45, bAmt: 0.025, rough: 1.2, fill: 'hachure',     hAng:   0, hGap: 5 },
-  pentagon: { color: [150,115,180], breath: 'drift',  bRate: 0.05, bAmt: 0.10,  rough: 1.6, fill: 'hachure',     hAng:  30, hGap: 5 },
+  circle:   { color: [230,175,50],  breath: 'pulse',  bRate: 0.30, bAmt: 0.055, rough: 1.5, fill: 'hachure',     hAng: -41, hGap: 5 },
+  triangle: { color: [230,90,100],  breath: 'flicker',bRate: 1.80, bAmt: 0.025, rough: 1.8, fill: 'cross-hatch', hAng:  60, hGap: 6 },
+  square:   { color: [80,150,200],  breath: 'tick',   bRate: 0.60, bAmt: 0.045, rough: 1.0, fill: 'hachure',     hAng:   0, hGap: 5 },
+  pentagon: { color: [170,110,210], breath: 'drift',  bRate: 0.05, bAmt: 0.10,  rough: 1.6, fill: 'hachure',     hAng:  30, hGap: 5 },
+  hexagon:  { color: [100,190,130], breath: 'kick',   bRate: 0.30, bAmt: 0.06,  rough: 1.3, fill: 'hachure',     hAng: -60, hGap: 5 },
 };
 
 const TYPES       = Object.keys(SHAPE_DEFS);
@@ -82,9 +83,11 @@ let audioOK  = false;
 let tapTime  = 0, tapId = -1;
 let proxPairs = [];
 let nextId   = 1;
+let volumeVal = 0.7;
+let volDrag   = false;
 
 let grainCvs, tableCvs;
-let masterComp, masterVerb;
+let masterComp, masterVerb, masterGain;
 
 /* =============================================================
    UTILITY
@@ -119,7 +122,8 @@ async function startAudio() {
   await Tone.start();
 
   masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 }).toDestination();
-  masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterVerb);
+  masterGain = new Tone.Gain(volumeVal).connect(masterVerb);
+  masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterGain);
   await masterVerb.ready;
 
   shapes.forEach(s => attachSynth(s));
@@ -136,39 +140,81 @@ function attachSynth(shape) {
         oscillator: { type: 'sine' },
         envelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
       });
-      const tr = new Tone.Tremolo({ frequency: 0.15, depth: 0.12 }).start();
+      const tr = new Tone.Tremolo({ frequency: 0.15, depth: 0.18 }).start();
       extras.push(tr);
       synth.chain(tr, masterComp);
       break;
     }
     case 'triangle': {
       synth = new Tone.FMSynth({
-        harmonicity: 2, modulationIndex: 0.9,
+        harmonicity: 3, modulationIndex: 1.4,
         oscillator: { type: 'sine' }, modulation: { type: 'sine' },
-        envelope: { attack: 2, decay: 0, sustain: 1, release: 2 },
-        modulationEnvelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
+        envelope: { attack: 1.5, decay: 0, sustain: 1, release: 2 },
+        modulationEnvelope: { attack: 1.5, decay: 0, sustain: 1, release: 2 }
       });
-      synth.connect(masterComp);
+      const ch = new Tone.Chorus({ frequency: 0.8, depth: 0.4, wet: 0.3 }).start();
+      extras.push(ch);
+      synth.chain(ch, masterComp);
       break;
     }
     case 'square': {
-      synth = new Tone.Synth({
-        oscillator: { type: 'square' },
-        envelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
+      // Percussive hi-hat / tick pattern
+      const gain = new Tone.Gain(0.5).connect(masterComp);
+      const noise = new Tone.NoiseSynth({
+        noise: { type: 'white' },
+        envelope: { attack: 0.001, decay: 0.06, sustain: 0, release: 0.02 }
       });
-      const f = new Tone.Filter({ frequency: 700, type: 'lowpass', rolloff: -12 });
-      const tr = new Tone.Tremolo({ frequency: 0.35, depth: 0.28 }).start();
-      extras.push(f, tr);
-      synth.chain(f, tr, masterComp);
-      break;
+      const bp = new Tone.Filter({ frequency: 6000, type: 'bandpass', Q: 2 });
+      noise.chain(bp, gain);
+      extras.push(gain, bp);
+      const bpm = 0.6 + shape.y * 0.8;
+      const loop = new Tone.Loop((t) => { noise.triggerAttackRelease('16n', t); }, `${bpm}`);
+      loop.start(0);
+      extras.push(loop);
+      if (Tone.Transport.state !== 'started') Tone.Transport.start();
+      synth = gain; // volume control target
+      synth._isRhythm = true;
+      synth._noise = noise;
+      synth._loop = loop;
+      shape.synth = synth;
+      shape.extras = extras;
+      synth.gain.value = Tone.dbToGain(volFromSize(shape.size));
+      return;
     }
     case 'pentagon': {
       synth = new Tone.Synth({
-        oscillator: { type: 'fatsine', count: 3, spread: 28 },
+        oscillator: { type: 'fatsine', count: 3, spread: 35 },
         envelope: { attack: 3, decay: 0, sustain: 1, release: 3 }
       });
-      synth.connect(masterComp);
+      const ph = new Tone.Phaser({ frequency: 0.15, octaves: 2, wet: 0.25 });
+      extras.push(ph);
+      synth.chain(ph, masterComp);
       break;
+    }
+    case 'hexagon': {
+      // Deep kick drum pulse
+      const gain = new Tone.Gain(0.6).connect(masterComp);
+      const memSynth = new Tone.MembraneSynth({
+        pitchDecay: 0.05, octaves: 4,
+        envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 }
+      });
+      memSynth.connect(gain);
+      extras.push(gain);
+      const rate = 1.2 + shape.y * 1.6;
+      const loop = new Tone.Loop((t) => {
+        memSynth.triggerAttackRelease(pitchFromY(shape.y) * 0.25, '8n', t);
+      }, `${rate}`);
+      loop.start(0);
+      extras.push(loop);
+      if (Tone.Transport.state !== 'started') Tone.Transport.start();
+      synth = gain;
+      synth._isRhythm = true;
+      synth._memSynth = memSynth;
+      synth._loop = loop;
+      shape.synth = synth;
+      shape.extras = extras;
+      synth.gain.value = Tone.dbToGain(volFromSize(shape.size));
+      return;
     }
   }
 
@@ -182,27 +228,60 @@ function detachSynth(shape) {
   if (!shape.synth) return;
   const s = shape.synth, ex = shape.extras || [];
   shape.synth = null; shape.extras = [];
-  s.volume.rampTo(-60, 0.6);
-  setTimeout(() => {
-    try { s.triggerRelease(); } catch(_){}
+  if (s._isRhythm) {
+    // Fade rhythm shapes via gain node
+    s.gain.rampTo(0, 0.6);
     setTimeout(() => {
-      try { s.dispose(); } catch(_){}
-      ex.forEach(e => { try { e.dispose(); } catch(_){} });
-    }, 3500);
-  }, 650);
+      ex.forEach(e => { try { if (e.stop) e.stop(); } catch(_){} });
+      setTimeout(() => {
+        ex.forEach(e => { try { e.dispose(); } catch(_){} });
+        try { if (s._noise) s._noise.dispose(); } catch(_){}
+        try { if (s._memSynth) s._memSynth.dispose(); } catch(_){}
+        try { s.dispose(); } catch(_){}
+      }, 500);
+    }, 650);
+  } else {
+    s.volume.rampTo(-60, 0.6);
+    setTimeout(() => {
+      try { s.triggerRelease(); } catch(_){}
+      setTimeout(() => {
+        try { s.dispose(); } catch(_){}
+        ex.forEach(e => { try { e.dispose(); } catch(_){} });
+      }, 3500);
+    }, 650);
+  }
 }
 
 function updateShapeAudio(shape) {
   if (!shape.synth) return;
-  shape.synth.frequency.rampTo(pitchFromY(shape.y), 0.12);
+  if (shape.synth._isRhythm) {
+    // Update loop rate for rhythmic shapes based on y position
+    if (shape.synth._loop) {
+      const rate = shape.type === 'square'
+        ? (0.6 + shape.y * 0.8)
+        : (1.2 + shape.y * 1.6);
+      shape.synth._loop.interval = `${rate}`;
+    }
+    if (shape.synth._memSynth) {
+      // Update kick pitch
+      shape.synth._memSynth.frequency.value = pitchFromY(shape.y) * 0.25;
+    }
+  } else {
+    shape.synth.frequency.rampTo(pitchFromY(shape.y), 0.12);
+  }
 }
 
 function applyProximityAudio() {
   shapes.forEach(s => {
     if (!s.synth) return;
-    const base  = volFromSize(s.size);
     const boost = Math.min(s.proxBoost || 0, 6);
-    s.synth.volume.rampTo(base + boost, 0.25);
+    if (s.synth._isRhythm) {
+      const baseGain = Tone.dbToGain(volFromSize(s.size));
+      s.synth.gain.rampTo(baseGain * (1 + boost * 0.15), 0.25);
+    } else {
+      const base = volFromSize(s.size);
+      s.synth.volume.rampTo(base + boost, 0.25);
+    }
   });
 }
 
@@ -279,8 +358,8 @@ function cacheShape(shape) {
   const crc = rough.canvas(c);
   const mid = px / 2, sz = shape.size * unit;
   const [r, g, b] = shape.rgb;
-  const sa = shape.isPalette ? 0.65 : 0.8;
-  const fa = shape.isPalette ? 0.12 : 0.15;
+  const sa = shape.isPalette ? 0.65 : 0.85;
+  const fa = shape.isPalette ? 0.12 : 0.20;
 
   const opts = {
     stroke: `rgba(${r},${g},${b},${sa})`,
@@ -319,6 +398,15 @@ function cacheShape(shape) {
       crc.polygon(pts, opts);
       break;
     }
+    case 'hexagon': {
+      const pts = [];
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2;
+        pts.push([mid + Math.cos(a) * sz * 0.48, mid + Math.sin(a) * sz * 0.48]);
+      }
+      crc.polygon(pts, opts);
+      break;
+    }
   }
 
   // Construction mark: center dot
@@ -339,13 +427,35 @@ function drawShape(shape, time) {
   const def = SHAPE_DEFS[shape.type];
   const t = time * 0.001;
   const bp = t * def.bRate * Math.PI * 2 + shape.phase;
-  let sc = 1, rot = 0;
+  let sc = 1, rot = 0, extraAlpha = 0;
 
   switch (def.breath) {
-    case 'pulse': sc  = 1 + Math.sin(bp) * def.bAmt; break;
-    case 'wobble': rot = Math.sin(bp) * def.bAmt; break;
-    case 'throb': sc   = 1 + Math.sin(bp) * def.bAmt; break;
-    case 'drift': rot  = bp * def.bAmt; break;
+    case 'pulse':
+      // Warm breathing — smooth sine pulse
+      sc = 1 + Math.sin(bp) * def.bAmt;
+      break;
+    case 'flicker':
+      // Shimmering — rapid small jitters + slow sway
+      sc = 1 + Math.sin(bp) * def.bAmt * 0.5;
+      rot = Math.sin(bp * 0.14) * 0.03 + Math.sin(bp * 3.7) * 0.008;
+      extraAlpha = Math.sin(bp * 2.3) * 0.08;
+      break;
+    case 'tick':
+      // Sharp metronomic snap — eased square-ish wave
+      { const raw = Math.sin(bp);
+        sc = 1 + Math.sign(raw) * Math.pow(Math.abs(raw), 0.3) * def.bAmt; }
+      break;
+    case 'drift':
+      // Ethereal slow rotation
+      rot = bp * def.bAmt;
+      sc = 1 + Math.sin(bp * 0.6) * 0.015;
+      break;
+    case 'kick':
+      // Punchy expand then relax
+      { const phase = ((bp % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+        const hit = Math.max(0, 1 - phase / 1.2);
+        sc = 1 + hit * hit * def.bAmt * 3; }
+      break;
   }
 
   // Lift when dragging
@@ -355,7 +465,7 @@ function drawShape(shape, time) {
   const glow = Math.min((shape.proxBoost || 0) / 4, 0.5);
 
   ctx.save();
-  ctx.globalAlpha = shape.opacity;
+  ctx.globalAlpha = clamp(shape.opacity + extraAlpha, 0, 1);
   ctx.translate(shape.x * W, shape.y * H);
   ctx.rotate(rot);
   ctx.scale(sc, sc);
@@ -456,6 +566,53 @@ function buildTable() {
 }
 
 /* =============================================================
+   VOLUME SLIDER
+   ============================================================= */
+
+const VOL_X = 0.06;
+
+function volSliderGeom() {
+  const x = VOL_X * W;
+  const y0 = H * (PAL_ZONE + 0.025);
+  const y1 = H * 0.975;
+  const knobY = y0 + (1 - volumeVal) * (y1 - y0);
+  const knobR = Math.max(10, unit * 0.012);
+  return { x, y0, y1, knobY, knobR };
+}
+
+function drawVolumeSlider() {
+  const { x, y0, y1, knobY, knobR } = volSliderGeom();
+  // Track line
+  rc.line(x, y0, x, y1, {
+    stroke: 'rgba(180,170,155,0.18)', strokeWidth: 1, roughness: 1.5, seed: 5555
+  });
+  // Knob
+  rc.circle(x, knobY, knobR * 2, {
+    stroke: 'rgba(200,190,170,0.5)', strokeWidth: 1.2, roughness: 1.2,
+    fill: 'rgba(200,190,170,0.08)', fillStyle: 'solid', seed: 5556
+  });
+  // Tiny speaker icon above
+  ctx.save();
+  ctx.font = `${Math.max(9, unit * 0.014)}px Georgia`;
+  ctx.fillStyle = 'rgba(180,170,155,0.18)';
+  ctx.textAlign = 'center';
+  ctx.fillText('♪', x, y0 - 6);
+  ctx.restore();
+}
+
+function hitVolSlider(px, py) {
+  const { x, y0, y1, knobY, knobR } = volSliderGeom();
+  const dx = px - x, dy = py - knobY;
+  return (dx * dx + dy * dy) < (knobR + 12) * (knobR + 12);
+}
+
+function updateVolFromY(py) {
+  const { y0, y1 } = volSliderGeom();
+  volumeVal = clamp(1 - (py - y0) / (y1 - y0), 0, 1);
+  if (masterGain) masterGain.gain.rampTo(volumeVal, 0.08);
+}
+
+/* =============================================================
    INTERACTION
    ============================================================= */
 
@@ -488,6 +645,14 @@ async function onDown(e) {
 
   const px = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
   const py = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+
+  // Volume slider
+  if (hitVolSlider(px, py)) {
+    volDrag = true;
+    updateVolFromY(py);
+    return;
+  }
+
   const hit = hitTest(px, py);
 
   // Double-tap → remove
@@ -524,6 +689,12 @@ async function onDown(e) {
 }
 
 function onMove(e) {
+  if (volDrag) {
+    e.preventDefault();
+    const my = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+    updateVolFromY(my);
+    return;
+  }
   if (!drag) return;
   e.preventDefault();
   const s = drag.shape;
@@ -537,6 +708,7 @@ function onMove(e) {
 }
 
 function onUp(e) {
+  volDrag = false;
   if (!drag) return;
   const s = drag.shape;
 
@@ -584,6 +756,9 @@ function draw(time) {
   // Palette shapes
   palette.forEach(s => drawShape(s, time));
 
+  // Volume slider
+  drawVolumeSlider();
+
   // Grain overlay
   if (grainCvs) {
     ctx.globalAlpha = 0.055;
@@ -599,8 +774,8 @@ function draw(time) {
 function initPalette() {
   palette = [];
   const count = TYPES.length;
-  const spacing = Math.min(0.18, 0.7 / count);
-  const startX = 0.5 - (count - 1) * spacing / 2;
+  const spacing = Math.min(0.15, 0.65 / count);
+  const startX = 0.52 - (count - 1) * spacing / 2;
   TYPES.forEach((t, i) => {
     palette.push(makeShape(t, startX + i * spacing, PAL_Y, true));
   });
