@@ -182,7 +182,7 @@ function initAudio() {
 // --- Synth builders per shape type ---
 
 function buildCircleSynth(freq) {
-  // Sine oscillator with tremolo (LFO on gain)
+  // Sine oscillator with tremolo + slow organic drift
   const osc = actx.createOscillator();
   osc.type = 'sine';
   osc.frequency.value = freq;
@@ -200,27 +200,50 @@ function buildCircleSynth(freq) {
   lfoGain.connect(gain.gain);
   lfo.start();
 
+  // Slow pitch drift — prevents static drone
+  const driftLfo = actx.createOscillator();
+  driftLfo.type = 'sine';
+  driftLfo.frequency.value = 0.07 + Math.random() * 0.05;
+  const driftGain = actx.createGain();
+  driftGain.gain.value = freq * 0.006;  // ~10 cents
+  driftLfo.connect(driftGain);
+  driftGain.connect(osc.frequency);
+  driftLfo.start();
+
+  // Slow amplitude swell at irrational rate
+  const swellLfo = actx.createOscillator();
+  swellLfo.type = 'sine';
+  swellLfo.frequency.value = 0.031 + Math.random() * 0.02;
+  const swellGain = actx.createGain();
+  swellGain.gain.value = 0.12;
+  swellLfo.connect(swellGain);
+  swellGain.connect(gain.gain);
+  swellLfo.start();
+
   osc.connect(gain);
   gain.connect(masterGain);
   osc.start();
 
-  return { osc, gain, lfo, lfoGain,
-    setFreq(f) { osc.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12); },
+  return { osc, gain, lfo, driftLfo, swellLfo,
+    setFreq(f) {
+      osc.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
+      driftGain.gain.value = f * 0.006;
+    },
     setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
       gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
-      setTimeout(() => { osc.stop(); lfo.stop(); }, 700);
+      setTimeout(() => { osc.stop(); lfo.stop(); driftLfo.stop(); swellLfo.stop(); }, 700);
     }
   };
 }
 
 function buildTriangleSynth(freq) {
-  // FM synthesis: modulator → carrier, with chorus (delayed detuned copy)
+  // FM synthesis with chorus + slow organic drift
   const mod = actx.createOscillator();
   mod.type = 'sine';
-  mod.frequency.value = freq * 3;  // harmonicity = 3
+  mod.frequency.value = freq * 3;
   const modGain = actx.createGain();
-  modGain.gain.value = freq * 1.4;  // modulationIndex * freq
+  modGain.gain.value = freq * 1.4;
   mod.connect(modGain);
 
   const carrier = actx.createOscillator();
@@ -244,6 +267,26 @@ function buildTriangleSynth(freq) {
   chorusDepth.connect(delay.delayTime);
   chorusLfo.start();
 
+  // Slow pitch drift
+  const driftLfo = actx.createOscillator();
+  driftLfo.type = 'sine';
+  driftLfo.frequency.value = 0.053 + Math.random() * 0.04;
+  const driftGain = actx.createGain();
+  driftGain.gain.value = freq * 0.005;
+  driftLfo.connect(driftGain);
+  driftGain.connect(carrier.frequency);
+  driftLfo.start();
+
+  // Slow FM depth modulation — timbre evolves over time
+  const fmLfo = actx.createOscillator();
+  fmLfo.type = 'sine';
+  fmLfo.frequency.value = 0.04 + Math.random() * 0.03;
+  const fmLfoGain = actx.createGain();
+  fmLfoGain.gain.value = freq * 0.4;
+  fmLfo.connect(fmLfoGain);
+  fmLfoGain.connect(modGain.gain);
+  fmLfo.start();
+
   const out = actx.createGain();
   out.gain.value = 0.25;
   carrier.connect(dry);
@@ -255,16 +298,18 @@ function buildTriangleSynth(freq) {
   carrier.start();
   mod.start();
 
-  return { carrier, mod, modGain, out, chorusLfo,
+  return { carrier, mod, modGain, out, chorusLfo, driftLfo, fmLfo,
     setFreq(f) {
       carrier.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
       mod.frequency.linearRampToValueAtTime(f * 3, actx.currentTime + 0.12);
       modGain.gain.linearRampToValueAtTime(f * 1.4, actx.currentTime + 0.12);
+      driftGain.gain.value = f * 0.005;
+      fmLfoGain.gain.value = f * 0.4;
     },
     setVol(v) { out.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
       out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
-      setTimeout(() => { carrier.stop(); mod.stop(); chorusLfo.stop(); }, 700);
+      setTimeout(() => { carrier.stop(); mod.stop(); chorusLfo.stop(); driftLfo.stop(); fmLfo.stop(); }, 700);
     }
   };
 }
@@ -313,7 +358,7 @@ function buildSquareSynth(shape) {
 }
 
 function buildPentagonSynth(freq) {
-  // Detuned unison: 3 sine oscillators with slight spread
+  // Detuned unison with phaser + slow organic drift
   const out = actx.createGain();
   out.gain.value = 0.2;
 
@@ -327,7 +372,30 @@ function buildPentagonSynth(freq) {
     return osc;
   });
 
-  // Simple phaser: chain of allpass filters with LFO
+  // Slow drift on detune spread — shimmer evolves
+  const driftLfos = oscs.map((osc, i) => {
+    const lfo = actx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.04 + i * 0.017 + Math.random() * 0.02;
+    const g = actx.createGain();
+    g.gain.value = 8;  // ±8 cents wander
+    lfo.connect(g);
+    g.connect(osc.detune);
+    lfo.start();
+    return lfo;
+  });
+
+  // Slow amplitude swell
+  const swellLfo = actx.createOscillator();
+  swellLfo.type = 'sine';
+  swellLfo.frequency.value = 0.037 + Math.random() * 0.025;
+  const swellGain = actx.createGain();
+  swellGain.gain.value = 0.08;
+  swellLfo.connect(swellGain);
+  swellGain.connect(out.gain);
+  swellLfo.start();
+
+  // Simple phaser: allpass filter with LFO
   const phaser = actx.createBiquadFilter();
   phaser.type = 'allpass';
   phaser.frequency.value = 1000;
@@ -354,39 +422,63 @@ function buildPentagonSynth(freq) {
   wet.connect(mix);
   mix.connect(masterGain);
 
-  return { oscs, out, mix, phaserLfo,
+  return { oscs, out, mix, phaserLfo, driftLfos, swellLfo,
     setFreq(f) {
       oscs.forEach(o => o.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12));
     },
     setVol(v) { mix.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
       mix.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
-      setTimeout(() => { oscs.forEach(o => o.stop()); phaserLfo.stop(); }, 700);
+      setTimeout(() => {
+        oscs.forEach(o => o.stop());
+        phaserLfo.stop(); swellLfo.stop();
+        driftLfos.forEach(l => l.stop());
+      }, 700);
     }
   };
 }
 
 function buildHexagonSynth(shape) {
-  // Membrane kick: sine with pitch sweep into sub-bass
+  // Organic kick: sine sweep + noise thump layer
   const gain = actx.createGain();
   gain.gain.value = 0.5;
   gain.connect(masterGain);
 
-  let basePitch = pitchFromY(shape.y) * 0.25;  // deep sub-bass floor
+  let basePitch = pitchFromY(shape.y) * 0.25;
 
   function kick() {
+    const now = actx.currentTime;
+    // Slight per-hit pitch variation for organic feel
+    const p = basePitch * (0.94 + Math.random() * 0.12);
+
+    // Sine body with pitch sweep
     const osc = actx.createOscillator();
     osc.type = 'sine';
-    const now = actx.currentTime;
-    osc.frequency.setValueAtTime(basePitch * 4, now);           // start lower
-    osc.frequency.exponentialRampToValueAtTime(basePitch, now + 0.12);  // slower sweep
-    const env = actx.createGain();
-    env.gain.setValueAtTime(1, now);
-    env.gain.exponentialRampToValueAtTime(0.001, now + 0.6);    // longer body
-    osc.connect(env);
-    env.connect(gain);
+    osc.frequency.setValueAtTime(p * 3.5, now);
+    osc.frequency.exponentialRampToValueAtTime(p, now + 0.15);
+    const oscEnv = actx.createGain();
+    oscEnv.gain.setValueAtTime(1, now);
+    oscEnv.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+    osc.connect(oscEnv);
+    oscEnv.connect(gain);
     osc.start(now);
     osc.stop(now + 0.7);
+
+    // Noise thump for attack texture
+    const nSrc = actx.createBufferSource();
+    nSrc.buffer = getNoiseBuffer();
+    const nFilt = actx.createBiquadFilter();
+    nFilt.type = 'lowpass';
+    nFilt.frequency.value = 200 + p * 2;
+    nFilt.Q.value = 0.7;
+    const nEnv = actx.createGain();
+    nEnv.gain.setValueAtTime(0.5, now);
+    nEnv.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+    nSrc.connect(nFilt);
+    nFilt.connect(nEnv);
+    nEnv.connect(gain);
+    nSrc.start(now);
+    nSrc.stop(now + 0.1);
   }
   let intervalId = setInterval(kick, (0.3 + shape.x * 1.2) * 1000);
   kick();
