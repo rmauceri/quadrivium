@@ -119,12 +119,10 @@ function initAudio() {
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // Create raw AudioContext for iOS compatibility
-  const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (rawCtx.state === 'suspended') rawCtx.resume();
-  Tone.setContext(rawCtx);
-
+  // Let Tone.js manage its own AudioContext — don't fight it.
+  // Tone.start() handles iOS/Safari gesture-unlock internally.
   Tone.start().then(() => {
+    Tone.Transport.bpm.value = 120;
     Tone.Transport.start();
     masterGain = new Tone.Gain(volumeVal).toDestination();
 
@@ -164,13 +162,13 @@ function attachSynth(shape) {
     case 'square': {
       const tick = new Tone.NoiseSynth({
         noise: { type: 'white' },
-        envelope: { attack: 0.001, decay: 0.05, sustain: 0, release: 0.02 },
-        volume: -4
+        envelope: { attack: 0.001, decay: 0.08, sustain: 0, release: 0.03 },
+        volume: 0
       });
       tick.connect(masterGain);
-      const rate = 0.2 + shape.x * 0.8;
+      const rate = 0.15 + shape.x * 0.6;
       const loop = new Tone.Loop((time) => {
-        tick.triggerAttackRelease('32n', time);
+        tick.triggerAttackRelease('16n', time);
       }, rate);
       loop.start();
       extras.push(loop);
@@ -191,13 +189,13 @@ function attachSynth(shape) {
     }
     case 'hexagon': {
       const kick = new Tone.MembraneSynth({
-        pitchDecay: 0.05, octaves: 6,
-        envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 },
-        volume: 0
+        pitchDecay: 0.05, octaves: 8,
+        envelope: { attack: 0.001, decay: 0.4, sustain: 0, release: 0.5 },
+        volume: 6
       });
       kick.connect(masterGain);
       extras = [];
-      const rate = 0.4 + shape.x * 1.6;
+      const rate = 0.3 + shape.x * 1.2;
       const loop = new Tone.Loop((time) => {
         kick.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', time);
       }, rate);
