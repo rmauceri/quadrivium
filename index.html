@@ -40,7 +40,7 @@ const SHAPE_DEFS = {
 };
 
 const TYPES       = Object.keys(SHAPE_DEFS);
-const BASE_SIZE   = 0.085;
+const BASE_SIZE   = 0.095;
 const SIZE_VARY   = 0.012;
 const PAL_SCALE   = 0.55;
 const PAL_Y       = 0.93;
@@ -367,39 +367,38 @@ function buildPentagonSynth(freq) {
 }
 
 function buildHexagonSynth(shape) {
-  // Membrane kick: sine oscillator with rapid pitch decay
+  // Membrane kick: sine with pitch sweep into sub-bass
   const gain = actx.createGain();
   gain.gain.value = 0.5;
   gain.connect(masterGain);
 
-  const basePitch = pitchFromY(shape.y) * 0.5;
-  const rate = 0.3 + shape.x * 1.2;
+  let basePitch = pitchFromY(shape.y) * 0.25;  // deep sub-bass floor
 
   function kick() {
     const osc = actx.createOscillator();
     osc.type = 'sine';
     const now = actx.currentTime;
-    osc.frequency.setValueAtTime(basePitch * 8, now);
-    osc.frequency.exponentialRampToValueAtTime(basePitch, now + 0.05);
+    osc.frequency.setValueAtTime(basePitch * 4, now);           // start lower
+    osc.frequency.exponentialRampToValueAtTime(basePitch, now + 0.12);  // slower sweep
     const env = actx.createGain();
     env.gain.setValueAtTime(1, now);
-    env.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+    env.gain.exponentialRampToValueAtTime(0.001, now + 0.6);    // longer body
     osc.connect(env);
     env.connect(gain);
     osc.start(now);
-    osc.stop(now + 0.5);
+    osc.stop(now + 0.7);
   }
-  let intervalId = setInterval(kick, rate * 1000);
+  let intervalId = setInterval(kick, (0.3 + shape.x * 1.2) * 1000);
   kick();
 
-  return { _isRhythm: true, gain, intervalId, rate, basePitch,
+  return { _isRhythm: true, gain, intervalId, basePitch,
     setRate(r) {
       clearInterval(intervalId);
       this.rate = r;
       intervalId = setInterval(kick, r * 1000);
       this.intervalId = intervalId;
     },
-    setPitch(p) { this.basePitch = p; },
+    setPitch(p) { basePitch = p; },
     setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
       clearInterval(intervalId);
