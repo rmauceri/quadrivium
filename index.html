@@ -482,11 +482,15 @@ function recomputeProximity() {
 
 function drawProximityLines() {
   proxPairs.forEach(({ a, b, strength }) => {
-    const alpha = strength * 0.22;
+    const alpha = strength * 0.45;
     if (alpha < 0.01) return;
+    // Blend the two shapes' colors for tinted resonance wisps
+    const r = Math.round((a.rgb[0] + b.rgb[0]) / 2);
+    const g = Math.round((a.rgb[1] + b.rgb[1]) / 2);
+    const bl = Math.round((a.rgb[2] + b.rgb[2]) / 2);
     rc.line(a.x * W, a.y * H, b.x * W, b.y * H, {
-      stroke: `rgba(200,190,170,${alpha})`,
-      strokeWidth: 0.4 + strength * 1.2,
+      stroke: `rgba(${r},${g},${bl},${alpha})`,
+      strokeWidth: 0.6 + strength * 1.8,
       roughness: 2.5,
       seed: a.seed ^ b.seed,
     });
