@@ -882,6 +882,7 @@ cvs.addEventListener('touchstart', (e) => {
     const hit = hitTest(cx, cy);
     if (hit && hit.from === 'shape') {
       twist = { shape: hit.shape, startAngle: angle, startVolAngle: hit.shape.volAngle };
+      tapId = -1; tapTime = 0;  // suppress double-tap from two-finger touch
     }
   }
 }, { passive: false });
