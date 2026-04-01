@@ -181,8 +181,8 @@ function attachSynth(shape) {
       const bp = new Tone.Filter({ frequency: 6000, type: 'bandpass', Q: 2 });
       noise.chain(bp, gain);
       extras.push(gain, bp);
-      const bpm = 0.6 + shape.y * 0.8;
-      const loop = new Tone.Loop((t) => { noise.triggerAttackRelease('16n', t); }, `${bpm}`);
+      const rate = 0.6 + shape.x * 0.8;
+      const loop = new Tone.Loop((t) => { noise.triggerAttackRelease('16n', t); }, `${rate}`);
       loop.start(0);
       extras.push(loop);
       if (Tone.Transport.state !== 'started') Tone.Transport.start();
@@ -215,7 +215,7 @@ function attachSynth(shape) {
       });
       memSynth.connect(gain);
       extras.push(gain);
-      const rate = 1.2 + shape.y * 1.6;
+      const rate = 1.2 + shape.x * 1.6;
       const loop = new Tone.Loop((t) => {
         memSynth.triggerAttackRelease(pitchFromY(shape.y) * 0.25, '8n', t);
       }, `${rate}`);
@@ -270,11 +270,11 @@ function detachSynth(shape) {
 function updateShapeAudio(shape) {
   if (!shape.synth) return;
   if (shape.synth._isRhythm) {
-    // Update loop rate for rhythmic shapes based on y position
+    // Update loop rate for rhythmic shapes: X → rate, Y → pitch
     if (shape.synth._loop) {
       const rate = shape.type === 'square'
-        ? (0.6 + shape.y * 0.8)
-        : (1.2 + shape.y * 1.6);
+        ? (0.6 + shape.x * 0.8)
+        : (1.2 + shape.x * 1.6);
       shape.synth._loop.interval = `${rate}`;
     }
     if (shape.synth._memSynth) {
