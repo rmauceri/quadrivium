@@ -181,14 +181,47 @@ function initAudio() {
 
 // --- Synth builders per shape type ---
 
+// Slow swell cycling: shapes breathe in and out over long periods
+// instead of droning continuously. Returns a cleanup function.
+function startSwellCycle(gainNode, baseVol) {
+  let stopped = false;
+  let timeout;
+
+  function cycle() {
+    if (stopped) return;
+    const now = actx.currentTime;
+    const rise = 3 + Math.random() * 4;     // 3-7s fade in
+    const hold = 2 + Math.random() * 3;     // 2-5s sustain
+    const fall = 3 + Math.random() * 4;     // 3-7s fade out
+    const rest = 2 + Math.random() * 5;     // 2-7s silence
+    const peak = baseVol * (0.7 + Math.random() * 0.3);
+    const floor = baseVol * 0.03;           // near-silence, not zero
+
+    gainNode.gain.cancelScheduledValues(now);
+    gainNode.gain.setValueAtTime(gainNode.gain.value, now);
+    gainNode.gain.linearRampToValueAtTime(peak, now + rise);
+    gainNode.gain.setValueAtTime(peak, now + rise + hold);
+    gainNode.gain.linearRampToValueAtTime(floor, now + rise + hold + fall);
+
+    timeout = setTimeout(cycle, (rise + hold + fall + rest) * 1000);
+  }
+
+  cycle();
+  return () => { stopped = true; clearTimeout(timeout); };
+}
+
 function buildCircleSynth(freq) {
-  // Sine oscillator with tremolo + slow organic drift
+  // Sine oscillator with tremolo + slow organic drift + swell cycling
   const osc = actx.createOscillator();
   osc.type = 'sine';
   osc.frequency.value = freq;
 
   const gain = actx.createGain();
   gain.gain.value = 0.3;
+
+  // Swell envelope — controls slow in/out breathing
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
 
   // Tremolo: LFO modulates gain
   const lfo = actx.createOscillator();
@@ -197,48 +230,42 @@ function buildCircleSynth(freq) {
   const lfoGain = actx.createGain();
   lfoGain.gain.value = 0.06;
   lfo.connect(lfoGain);
-  lfoGain.connect(gain.gain);
+  lfoGain.connect(envelope.gain);
   lfo.start();
 
-  // Slow pitch drift — prevents static drone
+  // Slow pitch drift
   const driftLfo = actx.createOscillator();
   driftLfo.type = 'sine';
   driftLfo.frequency.value = 0.07 + Math.random() * 0.05;
   const driftGain = actx.createGain();
-  driftGain.gain.value = freq * 0.006;  // ~10 cents
+  driftGain.gain.value = freq * 0.006;
   driftLfo.connect(driftGain);
   driftGain.connect(osc.frequency);
   driftLfo.start();
 
-  // Slow amplitude swell at irrational rate
-  const swellLfo = actx.createOscillator();
-  swellLfo.type = 'sine';
-  swellLfo.frequency.value = 0.031 + Math.random() * 0.02;
-  const swellGain = actx.createGain();
-  swellGain.gain.value = 0.12;
-  swellLfo.connect(swellGain);
-  swellGain.connect(gain.gain);
-  swellLfo.start();
-
-  osc.connect(gain);
+  osc.connect(envelope);
+  envelope.connect(gain);
   gain.connect(masterGain);
   osc.start();
 
-  return { osc, gain, lfo, driftLfo, swellLfo,
+  const stopSwell = startSwellCycle(envelope, 1.0);
+
+  return { osc, gain, envelope, lfo, driftLfo,
     setFreq(f) {
       osc.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
       driftGain.gain.value = f * 0.006;
     },
     setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
+      stopSwell();
       gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
-      setTimeout(() => { osc.stop(); lfo.stop(); driftLfo.stop(); swellLfo.stop(); }, 700);
+      setTimeout(() => { osc.stop(); lfo.stop(); driftLfo.stop(); }, 700);
     }
   };
 }
 
 function buildTriangleSynth(freq) {
-  // FM synthesis with chorus + slow organic drift
+  // FM synthesis with chorus + slow organic drift + swell cycling
   const mod = actx.createOscillator();
   mod.type = 'sine';
   mod.frequency.value = freq * 3;
@@ -287,18 +314,26 @@ function buildTriangleSynth(freq) {
   fmLfoGain.connect(modGain.gain);
   fmLfo.start();
 
-  const out = actx.createGain();
-  out.gain.value = 0.25;
+  // Swell envelope
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+
   carrier.connect(dry);
   carrier.connect(delay);
   delay.connect(wet);
-  dry.connect(out);
-  wet.connect(out);
+  dry.connect(envelope);
+  wet.connect(envelope);
+
+  const out = actx.createGain();
+  out.gain.value = 0.25;
+  envelope.connect(out);
   out.connect(masterGain);
   carrier.start();
   mod.start();
 
-  return { carrier, mod, modGain, out, chorusLfo, driftLfo, fmLfo,
+  const stopSwell = startSwellCycle(envelope, 1.0);
+
+  return { carrier, mod, modGain, out, envelope, chorusLfo, driftLfo, fmLfo,
     setFreq(f) {
       carrier.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
       mod.frequency.linearRampToValueAtTime(f * 3, actx.currentTime + 0.12);
@@ -308,6 +343,7 @@ function buildTriangleSynth(freq) {
     },
     setVol(v) { out.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
+      stopSwell();
       out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
       setTimeout(() => { carrier.stop(); mod.stop(); chorusLfo.stop(); driftLfo.stop(); fmLfo.stop(); }, 700);
     }
@@ -358,7 +394,7 @@ function buildSquareSynth(shape) {
 }
 
 function buildPentagonSynth(freq) {
-  // Detuned unison with phaser + slow organic drift
+  // Detuned unison with phaser + slow organic drift + swell cycling
   const out = actx.createGain();
   out.gain.value = 0.2;
 
@@ -378,22 +414,12 @@ function buildPentagonSynth(freq) {
     lfo.type = 'sine';
     lfo.frequency.value = 0.04 + i * 0.017 + Math.random() * 0.02;
     const g = actx.createGain();
-    g.gain.value = 8;  // ±8 cents wander
+    g.gain.value = 8;
     lfo.connect(g);
     g.connect(osc.detune);
     lfo.start();
     return lfo;
   });
-
-  // Slow amplitude swell
-  const swellLfo = actx.createOscillator();
-  swellLfo.type = 'sine';
-  swellLfo.frequency.value = 0.037 + Math.random() * 0.025;
-  const swellGain = actx.createGain();
-  swellGain.gain.value = 0.08;
-  swellLfo.connect(swellGain);
-  swellGain.connect(out.gain);
-  swellLfo.start();
 
   // Simple phaser: allpass filter with LFO
   const phaser = actx.createBiquadFilter();
@@ -408,7 +434,11 @@ function buildPentagonSynth(freq) {
   phaserDepth.connect(phaser.frequency);
   phaserLfo.start();
 
-  // Mix dry/wet
+  // Swell envelope
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+
+  // Mix dry/wet → envelope → mix
   const dry = actx.createGain();
   dry.gain.value = 0.75;
   const wet = actx.createGain();
@@ -416,22 +446,26 @@ function buildPentagonSynth(freq) {
   out.connect(dry);
   out.connect(phaser);
   phaser.connect(wet);
+  dry.connect(envelope);
+  wet.connect(envelope);
   const mix = actx.createGain();
   mix.gain.value = 1;
-  dry.connect(mix);
-  wet.connect(mix);
+  envelope.connect(mix);
   mix.connect(masterGain);
 
-  return { oscs, out, mix, phaserLfo, driftLfos, swellLfo,
+  const stopSwell = startSwellCycle(envelope, 1.0);
+
+  return { oscs, out, mix, envelope, phaserLfo, driftLfos,
     setFreq(f) {
       oscs.forEach(o => o.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12));
     },
     setVol(v) { mix.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
+      stopSwell();
       mix.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
       setTimeout(() => {
         oscs.forEach(o => o.stop());
-        phaserLfo.stop(); swellLfo.stop();
+        phaserLfo.stop();
         driftLfos.forEach(l => l.stop());
       }, 700);
     }
