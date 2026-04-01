@@ -120,6 +120,27 @@ function getNoiseBuffer() {
   return noiseBuffer;
 }
 
+function buildImpulse(ctx, decay, duration) {
+  const len = ctx.sampleRate * duration;
+  const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) {
+      const t = i / ctx.sampleRate;
+      // Exponential decay with early reflection bump
+      const env = Math.exp(-t * decay) * (1 + 0.3 * Math.exp(-t * 18));
+      // Warm: low-pass by averaging neighbors
+      const noise = Math.random() * 2 - 1;
+      data[i] = noise * env;
+    }
+    // Simple low-pass smoothing for warmth
+    for (let i = 1; i < len; i++) {
+      data[i] = data[i] * 0.55 + data[i - 1] * 0.45;
+    }
+  }
+  return buf;
+}
+
 function initAudio() {
   if (audioOK) return;
   audioOK = true;
@@ -132,7 +153,19 @@ function initAudio() {
 
   masterGain = actx.createGain();
   masterGain.gain.value = volumeVal;
-  masterGain.connect(actx.destination);
+
+  // Reverb send: masterGain → dry + wet(convolver) → destination
+  const dryGain = actx.createGain();
+  dryGain.gain.value = 0.75;
+  const wetGain = actx.createGain();
+  wetGain.gain.value = 0.35;
+  const convolver = actx.createConvolver();
+  convolver.buffer = buildImpulse(actx, 2.2, 3.5);
+  masterGain.connect(dryGain);
+  masterGain.connect(convolver);
+  convolver.connect(wetGain);
+  dryGain.connect(actx.destination);
+  wetGain.connect(actx.destination);
 
   shapes.forEach(s => attachSynth(s));
   recomputeProximity();
@@ -618,6 +651,20 @@ function drawShape(shape, time) {
     ctx.beginPath();
     ctx.arc(0, 0, shape._cache.width * 0.6, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  // Stroke luminosity — blurred glow underneath the sharp shape,
+  // like chalk catching lamplight from within.
+  if (!shape.isPalette) {
+    const breathGlow = 0.5 + Math.sin(bp) * 0.2;  // pulse with breath
+    const proxGlow = Math.min(glow * 0.5, 0.2);
+    const glowAlpha = (0.25 + proxGlow) * breathGlow;
+    const blurPx = Math.max(6, shape._cache.width * 0.12);
+    ctx.save();
+    ctx.globalAlpha *= glowAlpha;
+    ctx.filter = `blur(${blurPx}px)`;
+    ctx.drawImage(shape._cache, -shape._cache.width / 2, -shape._cache.height / 2);
+    ctx.restore();
   }
 
   ctx.drawImage(shape._cache, -shape._cache.width / 2, -shape._cache.height / 2);
