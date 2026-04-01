@@ -119,13 +119,11 @@ async function startAudio() {
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // iOS Safari: native audio unlock before Tone
-  try {
-    const snd = new Audio('data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA/+M4wAAAAAAAAAAAAEluZm8AAAAPAAAAAgAAAbAAqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAAbC8s5LGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/+M4wAAAAAAA0gAAAAATEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/4zjAAAAAAAANIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
-    snd.volume = 0.01;
-    await snd.play();
-    snd.pause();
-  } catch(_){}
+  // iOS-safe: create raw AudioContext synchronously in the gesture handler
+  // then hand it to Tone.js — this is the proven wunderkammer pattern
+  const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (rawCtx.state === 'suspended') rawCtx.resume();
+  Tone.setContext(rawCtx);
 
   await Tone.start();
   Tone.Transport.start();
@@ -647,10 +645,10 @@ function hitTest(px, py) {
   return null;
 }
 
-async function onDown(e) {
-  // Audio unlock MUST happen before preventDefault on iOS
+function onDown(e) {
+  // Audio unlock MUST be synchronous on iOS — no awaits before it
   if (!audioOK) {
-    await startAudio();
+    startAudio();
   }
 
   e.preventDefault();
