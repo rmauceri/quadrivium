@@ -80,7 +80,6 @@ let shapes   = [];
 let palette  = [];
 let drag     = null;
 let audioOK  = false;
-let audioInit = false;
 let tapTime  = 0, tapId = -1;
 let proxPairs = [];
 let nextId   = 1;
@@ -103,7 +102,7 @@ function pitchFromY(y) {
 
 function volFromSize(sz) {
   const t = clamp((sz - 0.04) / 0.04, 0, 1);
-  return -32 + t * 8;
+  return -26 + t * 8;
 }
 
 function pxDist(a, b) {
@@ -115,36 +114,40 @@ function pxDist(a, b) {
    AUDIO ENGINE
    ============================================================= */
 
-function unlockAudio() {
-  if (audioInit) return;
-  audioInit = true;
+function initAudio() {
+  if (audioOK) return;
+  audioOK = true;
+  document.getElementById('overlay').classList.add('hidden');
 
-  // Synchronous AudioContext creation — proven iOS pattern from wunderkammer
+  // Synchronous AudioContext — works on iOS/Android/desktop
   const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (rawCtx.state === 'suspended') rawCtx.resume();
   Tone.setContext(rawCtx);
 
-  // Fire-and-forget the async setup
-  Tone.start().then(() => {
-    Tone.Transport.start();
+  // Tone.start returns a promise but the raw context is already running
+  Tone.start().catch(() => {});
+  Tone.Transport.start();
 
-    masterGain = new Tone.Gain(volumeVal).toDestination();
-    masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterGain);
+  masterGain = new Tone.Gain(volumeVal).toDestination();
+  masterComp = new Tone.Compressor({ threshold: -18, ratio: 2.5, attack: 0.05, release: 0.25 }).connect(masterGain);
 
-    // Reverb connects async — first notes play dry, reverb fades in when ready
-    masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
-    masterVerb.ready.then(() => {
-      try { masterVerb.connect(Tone.Destination); masterGain.disconnect(); masterGain.connect(masterVerb); } catch(_){}
-    }).catch(() => {});
+  // Reverb setup — non-blocking
+  masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
+  masterVerb.ready.then(() => {
+    try {
+      masterVerb.connect(Tone.Destination);
+      masterGain.disconnect();
+      masterGain.connect(masterVerb);
+    } catch(_){}
+  }).catch(() => {});
 
-    shapes.forEach(s => attachSynth(s));
-    recomputeProximity();
-    audioOK = true;
-  }).catch(() => { audioInit = false; });
+  // Attach synths to any shapes already on the table
+  shapes.forEach(s => attachSynth(s));
+  recomputeProximity();
 }
 
 function attachSynth(shape) {
-  if (shape.synth || shape.isPalette) return;
+  if (shape.synth || shape.isPalette || !audioOK) return;
   let synth, extras = [];
 
   switch (shape.type) {
@@ -171,28 +174,24 @@ function attachSynth(shape) {
       break;
     }
     case 'square': {
-      // Percussive tick / rimshot pattern — cuts through drones
-      const gain = new Tone.Gain(1.0).connect(masterComp);
-      const noise = new Tone.NoiseSynth({
+      // Percussive tick — short noise burst on a loop
+      const tick = new Tone.NoiseSynth({
         noise: { type: 'white' },
-        envelope: { attack: 0.001, decay: 0.08, sustain: 0, release: 0.03 }
+        envelope: { attack: 0.001, decay: 0.05, sustain: 0, release: 0.02 },
+        volume: -6
       });
-      const bp = new Tone.Filter({ frequency: 4500, type: 'bandpass', Q: 3 });
-      noise.chain(bp, gain);
-      extras.push(gain, bp);
-      // X controls rate: left=fast (0.15s = 16ths), right=slow (1.0s)
-      const rate = 0.15 + shape.x * 0.85;
-      const loop = new Tone.Loop((t) => { noise.triggerAttackRelease('32n', t); }, `${rate}`);
+      const filt = new Tone.Filter({ frequency: 5000, type: 'bandpass', Q: 2 });
+      tick.chain(filt, masterGain); // direct to master, skip compressor
+      extras.push(filt);
+      const rate = 0.2 + shape.x * 0.8;
+      const loop = new Tone.Loop((time) => {
+        tick.triggerAttackRelease('32n', time);
+      }, rate);
       loop.start(0);
       extras.push(loop);
-      if (Tone.Transport.state !== 'started') Tone.Transport.start();
-      synth = gain;
-      synth._isRhythm = true;
-      synth._noise = noise;
-      synth._loop = loop;
+      synth = { _isRhythm: true, _src: tick, _loop: loop, _filt: filt, volume: tick.volume };
       shape.synth = synth;
       shape.extras = extras;
-      synth.gain.value = Tone.dbToGain(volFromSize(shape.size)) * 2;
       return;
     }
     case 'pentagon': {
@@ -206,37 +205,21 @@ function attachSynth(shape) {
       break;
     }
     case 'hexagon': {
-      // Punchy kick — bypasses compressor for impact, wider rate range
-      const gain = new Tone.Gain(1.8).connect(masterGain);
-      const memSynth = new Tone.MembraneSynth({
-        pitchDecay: 0.06, octaves: 8,
-        envelope: { attack: 0.002, decay: 0.25, sustain: 0, release: 0.3 },
-        volume: 2
+      // Kick drum — MembraneSynth is purpose-built for this
+      const kick = new Tone.MembraneSynth({
+        pitchDecay: 0.05, octaves: 6,
+        envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 },
+        volume: 0
       });
-      // Layer a click transient for attack presence
-      const click = new Tone.NoiseSynth({
-        noise: { type: 'white' },
-        envelope: { attack: 0.001, decay: 0.015, sustain: 0, release: 0.01 }
-      });
-      const clickFilt = new Tone.Filter({ frequency: 3000, type: 'highpass' });
-      const clickGain = new Tone.Gain(0.6);
-      click.chain(clickFilt, clickGain, gain);
-      memSynth.connect(gain);
-      extras.push(gain, clickFilt, clickGain);
-      // X controls rate: left=fast (0.25s), right=slow (2.0s)
-      const rate = 0.25 + shape.x * 1.75;
-      const loop = new Tone.Loop((t) => {
-        memSynth.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', t);
-        click.triggerAttackRelease('64n', t);
-      }, `${rate}`);
+      kick.connect(masterGain); // direct to master, skip compressor
+      extras = [];
+      const rate = 0.4 + shape.x * 1.6;
+      const loop = new Tone.Loop((time) => {
+        kick.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', time);
+      }, rate);
       loop.start(0);
       extras.push(loop);
-      if (Tone.Transport.state !== 'started') Tone.Transport.start();
-      synth = gain;
-      synth._isRhythm = true;
-      synth._memSynth = memSynth;
-      synth._click = click;
-      synth._loop = loop;
+      synth = { _isRhythm: true, _src: kick, _loop: loop, volume: kick.volume };
       shape.synth = synth;
       shape.extras = extras;
       return;
@@ -253,19 +236,15 @@ function detachSynth(shape) {
   if (!shape.synth) return;
   const s = shape.synth, ex = shape.extras || [];
   shape.synth = null; shape.extras = [];
+
   if (s._isRhythm) {
-    // Fade rhythm shapes via gain node
-    s.gain.rampTo(0, 0.6);
+    if (s._loop) try { s._loop.stop(); s._loop.dispose(); } catch(_){}
+    s.volume.rampTo(-60, 0.5);
     setTimeout(() => {
-      ex.forEach(e => { try { if (e.stop) e.stop(); } catch(_){} });
-      setTimeout(() => {
-        ex.forEach(e => { try { e.dispose(); } catch(_){} });
-        try { if (s._noise) s._noise.dispose(); } catch(_){}
-        try { if (s._memSynth) s._memSynth.dispose(); } catch(_){}
-        try { if (s._click) s._click.dispose(); } catch(_){}
-        try { s.dispose(); } catch(_){}
-      }, 500);
-    }, 650);
+      try { if (s._src) s._src.dispose(); } catch(_){}
+      try { if (s._filt) s._filt.dispose(); } catch(_){}
+      ex.forEach(e => { try { e.dispose(); } catch(_){} });
+    }, 600);
   } else {
     s.volume.rampTo(-60, 0.6);
     setTimeout(() => {
@@ -281,16 +260,14 @@ function detachSynth(shape) {
 function updateShapeAudio(shape) {
   if (!shape.synth) return;
   if (shape.synth._isRhythm) {
-    // Update loop rate for rhythmic shapes: X → rate, Y → pitch
     if (shape.synth._loop) {
       const rate = shape.type === 'square'
-        ? (0.15 + shape.x * 0.85)
-        : (0.25 + shape.x * 1.75);
-      shape.synth._loop.interval = `${rate}`;
+        ? (0.2 + shape.x * 0.8)
+        : (0.4 + shape.x * 1.6);
+      shape.synth._loop.interval = rate; // number, not string
     }
-    if (shape.synth._memSynth) {
-      // Update kick pitch
-      shape.synth._memSynth.frequency.value = pitchFromY(shape.y) * 0.5;
+    if (shape.synth._src && shape.synth._src.frequency) {
+      shape.synth._src.frequency.value = pitchFromY(shape.y) * 0.5;
     }
   } else {
     shape.synth.frequency.rampTo(pitchFromY(shape.y), 0.12);
@@ -300,14 +277,9 @@ function updateShapeAudio(shape) {
 function applyProximityAudio() {
   shapes.forEach(s => {
     if (!s.synth) return;
+    const base  = volFromSize(s.size);
     const boost = Math.min(s.proxBoost || 0, 6);
-    if (s.synth._isRhythm) {
-      const baseGain = Tone.dbToGain(volFromSize(s.size));
-      s.synth.gain.rampTo(baseGain * (1 + boost * 0.15), 0.25);
-    } else {
-      const base = volFromSize(s.size);
-      s.synth.volume.rampTo(base + boost, 0.25);
-    }
+    s.synth.volume.rampTo(base + boost, 0.25);
   });
 }
 
@@ -662,14 +634,8 @@ function onDown(e) {
   e.preventDefault();
   if (e.pointerId != null) cvs.setPointerCapture(e.pointerId);
 
-  // First tap: unlock audio and dismiss overlay
-  if (!audioInit) {
-    unlockAudio();
-    document.getElementById('overlay').classList.add('hidden');
-    return;
-  }
-
-  if (!audioOK) return;
+  // First touch: init audio. Interaction still works this same tap.
+  if (!audioOK) initAudio();
 
   const px = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
   const py = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
@@ -757,11 +723,7 @@ cvs.addEventListener('pointercancel', () => { drag = null; });
 
 // iOS Safari fallback — touchstart is more reliable for audio unlock
 cvs.addEventListener('touchstart', (e) => {
-  if (!audioInit) {
-    unlockAudio();
-    document.getElementById('overlay').classList.add('hidden');
-    e.preventDefault();
-  }
+  if (!audioOK) { initAudio(); e.preventDefault(); }
 }, { passive: false });
 
 /* =============================================================
