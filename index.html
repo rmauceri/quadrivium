@@ -897,14 +897,23 @@ cvs.addEventListener('pointermove', onMove, { passive: false });
 cvs.addEventListener('pointerup', onUp);
 cvs.addEventListener('pointercancel', () => { drag = null; });
 
-// iOS Safari fallback — touchstart is more reliable for audio unlock
+// touchstart is a valid user activation for AudioContext (pointerdown is NOT on touch).
+// pointerdown fires first and creates the context, but it stays suspended.
+// This handler resumes it from a real touch gesture.
 cvs.addEventListener('touchstart', (e) => {
   if (!audioOK) { initAudio(); e.preventDefault(); }
+  if (actx && actx.state !== 'running') actx.resume();
 }, { passive: false });
 
 // Document-level fallback unlock — catches taps outside the canvas
-document.addEventListener('click', () => { if (!audioOK) initAudio(); }, { once: true });
-document.addEventListener('touchstart', () => { if (!audioOK) initAudio(); }, { once: true });
+document.addEventListener('click', () => {
+  if (!audioOK) initAudio();
+  if (actx && actx.state !== 'running') actx.resume();
+}, { once: true });
+document.addEventListener('touchstart', () => {
+  if (!audioOK) initAudio();
+  if (actx && actx.state !== 'running') actx.resume();
+}, { once: true });
 
 /* =============================================================
    SCENE DRAWING
