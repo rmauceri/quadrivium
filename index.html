@@ -29,7 +29,6 @@ canvas { display: block; touch-action: none; }
 <div id="overlay"><span>touch to begin</span></div>
 
 <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js"></script>
 <script>
 'use strict';
 
@@ -88,6 +87,7 @@ let volDrag   = false;
 
 let grainCvs, tableCvs;
 let masterGain;
+let actx;           // raw AudioContext — created in gesture handler
 
 /* =============================================================
    UTILITY
@@ -101,8 +101,9 @@ function pitchFromY(y) {
 }
 
 function volFromSize(sz) {
+  // returns a linear gain 0..1
   const t = clamp((sz - 0.04) / 0.04, 0, 1);
-  return -26 + t * 8;
+  return 0.05 + t * 0.25;
 }
 
 function pxDist(a, b) {
@@ -111,175 +112,311 @@ function pxDist(a, b) {
 }
 
 /* =============================================================
-   AUDIO ENGINE
+   AUDIO ENGINE  (raw Web Audio API)
    ============================================================= */
 
-async function initAudio() {
+// Noise buffer (shared, created once)
+let noiseBuffer = null;
+function getNoiseBuffer() {
+  if (noiseBuffer) return noiseBuffer;
+  const len = actx.sampleRate * 2;
+  noiseBuffer = actx.createBuffer(1, len, actx.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  return noiseBuffer;
+}
+
+function initAudio() {
   if (audioOK) return;
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // Create a raw AudioContext DIRECTLY in the gesture handler —
-  // this is the only way to get a gesture-blessed context on
-  // strict mobile browsers.  Then hand it to Tone.js.
-  const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (rawCtx.state === 'suspended') rawCtx.resume();
-  Tone.setContext(rawCtx);
+  // Create AudioContext directly in the gesture handler —
+  // this is the only reliable way to get a "gesture-blessed"
+  // context on mobile browsers.
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === 'suspended') actx.resume();
 
-  // await ensures the context is fully running before we build
-  // the graph — this is critical for Transport and triggerAttack.
-  // Called without await from onDown, so the gesture handler
-  // returns immediately; the graph builds asynchronously once
-  // the context is confirmed running.
-  await Tone.start();
-
-  // DEBUG — temporary diagnostics
-  const dbg = document.createElement('div');
-  dbg.id = 'dbg';
-  dbg.style.cssText = 'position:fixed;top:0;left:0;background:rgba(0,0,0,0.8);color:#0f0;font:12px monospace;padding:6px;z-index:9999;white-space:pre';
-  document.body.appendChild(dbg);
-  function updateDbg(msg) {
-    dbg.textContent = `ctx: ${rawCtx.state} | t: ${rawCtx.currentTime.toFixed(2)} | shapes: ${shapes.filter(s=>s.synth&&!s.isPalette).length}/${shapes.filter(s=>!s.isPalette).length}\n${msg}`;
-  }
-  setInterval(() => updateDbg('poll'), 500);
-
-  updateDbg('post-await, building graph');
-  Tone.Transport.bpm.value = 120;
-  Tone.Transport.start();
-  masterGain = new Tone.Gain(volumeVal).toDestination();
+  masterGain = actx.createGain();
+  masterGain.gain.value = volumeVal;
+  masterGain.connect(actx.destination);
 
   shapes.forEach(s => attachSynth(s));
   recomputeProximity();
-  updateDbg('graph built, synths attached');
 
-  // iOS 17.5+ visibility bug — context gets interrupted on tab switch
+  // iOS 17.5+ visibility bug — context interrupted on tab switch
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      if (rawCtx.state !== 'running') rawCtx.resume();
+    if (document.visibilityState === 'visible' && actx.state !== 'running') {
+      actx.resume();
     }
   });
 }
 
+// --- Synth builders per shape type ---
+
+function buildCircleSynth(freq) {
+  // Sine oscillator with tremolo (LFO on gain)
+  const osc = actx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+
+  const gain = actx.createGain();
+  gain.gain.value = 0.3;
+
+  // Tremolo: LFO modulates gain
+  const lfo = actx.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.value = 0.15;
+  const lfoGain = actx.createGain();
+  lfoGain.gain.value = 0.06;
+  lfo.connect(lfoGain);
+  lfoGain.connect(gain.gain);
+  lfo.start();
+
+  osc.connect(gain);
+  gain.connect(masterGain);
+  osc.start();
+
+  return { osc, gain, lfo, lfoGain,
+    setFreq(f) { osc.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12); },
+    setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    destroy() {
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { osc.stop(); lfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildTriangleSynth(freq) {
+  // FM synthesis: modulator → carrier, with chorus (delayed detuned copy)
+  const mod = actx.createOscillator();
+  mod.type = 'sine';
+  mod.frequency.value = freq * 3;  // harmonicity = 3
+  const modGain = actx.createGain();
+  modGain.gain.value = freq * 1.4;  // modulationIndex * freq
+  mod.connect(modGain);
+
+  const carrier = actx.createOscillator();
+  carrier.type = 'sine';
+  carrier.frequency.value = freq;
+  modGain.connect(carrier.frequency);
+
+  // Simple chorus: delay with LFO
+  const dry = actx.createGain();
+  dry.gain.value = 0.7;
+  const wet = actx.createGain();
+  wet.gain.value = 0.3;
+  const delay = actx.createDelay();
+  delay.delayTime.value = 0.012;
+  const chorusLfo = actx.createOscillator();
+  chorusLfo.type = 'sine';
+  chorusLfo.frequency.value = 0.8;
+  const chorusDepth = actx.createGain();
+  chorusDepth.gain.value = 0.004;
+  chorusLfo.connect(chorusDepth);
+  chorusDepth.connect(delay.delayTime);
+  chorusLfo.start();
+
+  const out = actx.createGain();
+  out.gain.value = 0.25;
+  carrier.connect(dry);
+  carrier.connect(delay);
+  delay.connect(wet);
+  dry.connect(out);
+  wet.connect(out);
+  out.connect(masterGain);
+  carrier.start();
+  mod.start();
+
+  return { carrier, mod, modGain, out, chorusLfo,
+    setFreq(f) {
+      carrier.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
+      mod.frequency.linearRampToValueAtTime(f * 3, actx.currentTime + 0.12);
+      modGain.gain.linearRampToValueAtTime(f * 1.4, actx.currentTime + 0.12);
+    },
+    setVol(v) { out.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    destroy() {
+      out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { carrier.stop(); mod.stop(); chorusLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildSquareSynth(shape) {
+  // White noise tick rhythm via setInterval
+  const gain = actx.createGain();
+  gain.gain.value = 0.25;
+  gain.connect(masterGain);
+
+  const rate = 0.15 + shape.x * 0.6;
+  function tick() {
+    const src = actx.createBufferSource();
+    src.buffer = getNoiseBuffer();
+    const env = actx.createGain();
+    env.gain.setValueAtTime(0.8, actx.currentTime);
+    env.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.08);
+    // Bandpass for hi-hat character
+    const bp = actx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 6000;
+    bp.Q.value = 2;
+    src.connect(bp);
+    bp.connect(env);
+    env.connect(gain);
+    src.start();
+    src.stop(actx.currentTime + 0.1);
+  }
+  let intervalId = setInterval(tick, rate * 1000);
+  tick();
+
+  return { _isRhythm: true, gain, intervalId, rate,
+    setRate(r) {
+      clearInterval(intervalId);
+      this.rate = r;
+      intervalId = setInterval(tick, r * 1000);
+      this.intervalId = intervalId;
+    },
+    setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    destroy() {
+      clearInterval(intervalId);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
+      setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
+    }
+  };
+}
+
+function buildPentagonSynth(freq) {
+  // Detuned unison: 3 sine oscillators with slight spread
+  const out = actx.createGain();
+  out.gain.value = 0.2;
+
+  const oscs = [-17.5, 0, 17.5].map(detune => {
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    osc.detune.value = detune;
+    osc.connect(out);
+    osc.start();
+    return osc;
+  });
+
+  // Simple phaser: chain of allpass filters with LFO
+  const phaser = actx.createBiquadFilter();
+  phaser.type = 'allpass';
+  phaser.frequency.value = 1000;
+  const phaserLfo = actx.createOscillator();
+  phaserLfo.type = 'sine';
+  phaserLfo.frequency.value = 0.15;
+  const phaserDepth = actx.createGain();
+  phaserDepth.gain.value = 800;
+  phaserLfo.connect(phaserDepth);
+  phaserDepth.connect(phaser.frequency);
+  phaserLfo.start();
+
+  // Mix dry/wet
+  const dry = actx.createGain();
+  dry.gain.value = 0.75;
+  const wet = actx.createGain();
+  wet.gain.value = 0.25;
+  out.connect(dry);
+  out.connect(phaser);
+  phaser.connect(wet);
+  const mix = actx.createGain();
+  mix.gain.value = 1;
+  dry.connect(mix);
+  wet.connect(mix);
+  mix.connect(masterGain);
+
+  return { oscs, out, mix, phaserLfo,
+    setFreq(f) {
+      oscs.forEach(o => o.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12));
+    },
+    setVol(v) { mix.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    destroy() {
+      mix.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { oscs.forEach(o => o.stop()); phaserLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildHexagonSynth(shape) {
+  // Membrane kick: sine oscillator with rapid pitch decay
+  const gain = actx.createGain();
+  gain.gain.value = 0.5;
+  gain.connect(masterGain);
+
+  const basePitch = pitchFromY(shape.y) * 0.5;
+  const rate = 0.3 + shape.x * 1.2;
+
+  function kick() {
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    const now = actx.currentTime;
+    osc.frequency.setValueAtTime(basePitch * 8, now);
+    osc.frequency.exponentialRampToValueAtTime(basePitch, now + 0.05);
+    const env = actx.createGain();
+    env.gain.setValueAtTime(1, now);
+    env.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+    osc.connect(env);
+    env.connect(gain);
+    osc.start(now);
+    osc.stop(now + 0.5);
+  }
+  let intervalId = setInterval(kick, rate * 1000);
+  kick();
+
+  return { _isRhythm: true, gain, intervalId, rate, basePitch,
+    setRate(r) {
+      clearInterval(intervalId);
+      this.rate = r;
+      intervalId = setInterval(kick, r * 1000);
+      this.intervalId = intervalId;
+    },
+    setPitch(p) { this.basePitch = p; },
+    setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    destroy() {
+      clearInterval(intervalId);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
+      setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
+    }
+  };
+}
+
 function attachSynth(shape) {
   if (shape.synth || shape.isPalette || !masterGain) return;
-  let synth, extras = [];
+  const freq = pitchFromY(shape.y);
+  let synth;
 
   switch (shape.type) {
-    case 'circle': {
-      synth = new Tone.Synth({
-        oscillator: { type: 'sine' },
-        envelope: { attack: 2, decay: 0, sustain: 1, release: 2 }
-      });
-      const tr = new Tone.Tremolo({ frequency: 0.15, depth: 0.18 }).start();
-      extras.push(tr);
-      synth.chain(tr, masterGain);
-      break;
-    }
-    case 'triangle': {
-      synth = new Tone.FMSynth({
-        harmonicity: 3, modulationIndex: 1.4,
-        oscillator: { type: 'sine' }, modulation: { type: 'sine' },
-        envelope: { attack: 1.5, decay: 0, sustain: 1, release: 2 },
-        modulationEnvelope: { attack: 1.5, decay: 0, sustain: 1, release: 2 }
-      });
-      const ch = new Tone.Chorus({ frequency: 0.8, depth: 0.4, wet: 0.3 }).start();
-      extras.push(ch);
-      synth.chain(ch, masterGain);
-      break;
-    }
-    case 'square': {
-      const tick = new Tone.NoiseSynth({
-        noise: { type: 'white' },
-        envelope: { attack: 0.001, decay: 0.08, sustain: 0, release: 0.03 },
-        volume: 0
-      });
-      tick.connect(masterGain);
-      const rate = 0.15 + shape.x * 0.6;
-      const loop = new Tone.Loop((time) => {
-        tick.triggerAttackRelease('16n', time);
-      }, rate);
-      loop.start();
-      extras.push(loop);
-      synth = { _isRhythm: true, _src: tick, _loop: loop, volume: tick.volume };
-      shape.synth = synth;
-      shape.extras = extras;
-      return;
-    }
-    case 'pentagon': {
-      synth = new Tone.Synth({
-        oscillator: { type: 'fatsine', count: 3, spread: 35 },
-        envelope: { attack: 3, decay: 0, sustain: 1, release: 3 }
-      });
-      const ph = new Tone.Phaser({ frequency: 0.15, octaves: 2, wet: 0.25 });
-      extras.push(ph);
-      synth.chain(ph, masterGain);
-      break;
-    }
-    case 'hexagon': {
-      const kick = new Tone.MembraneSynth({
-        pitchDecay: 0.05, octaves: 8,
-        envelope: { attack: 0.001, decay: 0.4, sustain: 0, release: 0.5 },
-        volume: 6
-      });
-      kick.connect(masterGain);
-      extras = [];
-      const rate = 0.3 + shape.x * 1.2;
-      const loop = new Tone.Loop((time) => {
-        kick.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', time);
-      }, rate);
-      loop.start();
-      extras.push(loop);
-      synth = { _isRhythm: true, _src: kick, _loop: loop, volume: kick.volume };
-      shape.synth = synth;
-      shape.extras = extras;
-      return;
-    }
+    case 'circle':   synth = buildCircleSynth(freq); break;
+    case 'triangle': synth = buildTriangleSynth(freq); break;
+    case 'square':   synth = buildSquareSynth(shape); break;
+    case 'pentagon': synth = buildPentagonSynth(freq); break;
+    case 'hexagon':  synth = buildHexagonSynth(shape); break;
   }
 
-  shape.synth  = synth;
-  shape.extras = extras;
-  synth.volume.value = volFromSize(shape.size);
-  synth.triggerAttack(pitchFromY(shape.y));
+  shape.synth = synth;
+  if (!synth._isRhythm) synth.setVol(volFromSize(shape.size));
 }
 
 function detachSynth(shape) {
   if (!shape.synth) return;
-  const s = shape.synth, ex = shape.extras || [];
-  shape.synth = null; shape.extras = [];
-
-  if (s._isRhythm) {
-    if (s._loop) try { s._loop.stop(); s._loop.dispose(); } catch(_){}
-    s.volume.rampTo(-60, 0.5);
-    setTimeout(() => {
-      try { if (s._src) s._src.dispose(); } catch(_){}
-      ex.forEach(e => { try { e.dispose(); } catch(_){} });
-    }, 600);
-  } else {
-    s.volume.rampTo(-60, 0.6);
-    setTimeout(() => {
-      try { s.triggerRelease(); } catch(_){}
-      setTimeout(() => {
-        try { s.dispose(); } catch(_){}
-        ex.forEach(e => { try { e.dispose(); } catch(_){} });
-      }, 3500);
-    }, 650);
-  }
+  shape.synth.destroy();
+  shape.synth = null;
 }
 
 function updateShapeAudio(shape) {
   if (!shape.synth) return;
   if (shape.synth._isRhythm) {
-    if (shape.synth._loop) {
-      const rate = shape.type === 'square'
-        ? (0.2 + shape.x * 0.8)
-        : (0.4 + shape.x * 1.6);
-      shape.synth._loop.interval = rate;
-    }
-    if (shape.synth._src && shape.synth._src.frequency) {
-      shape.synth._src.frequency.value = pitchFromY(shape.y) * 0.5;
+    const rate = shape.type === 'square'
+      ? (0.2 + shape.x * 0.8)
+      : (0.4 + shape.x * 1.6);
+    shape.synth.setRate(rate);
+    if (shape.synth.setPitch) {
+      shape.synth.setPitch(pitchFromY(shape.y) * 0.5);
     }
   } else {
-    shape.synth.frequency.rampTo(pitchFromY(shape.y), 0.12);
+    shape.synth.setFreq(pitchFromY(shape.y));
   }
 }
 
@@ -287,8 +424,8 @@ function applyProximityAudio() {
   shapes.forEach(s => {
     if (!s.synth) return;
     const base  = volFromSize(s.size);
-    const boost = Math.min(s.proxBoost || 0, 6);
-    s.synth.volume.rampTo(base + boost, 0.25);
+    const boost = Math.min(s.proxBoost || 0, 0.3);
+    s.synth.setVol(base + boost);
   });
 }
 
@@ -616,7 +753,7 @@ function hitVolSlider(px, py) {
 function updateVolFromY(py) {
   const { y0, y1 } = volSliderGeom();
   volumeVal = clamp(1 - (py - y0) / (y1 - y0), 0, 1);
-  if (masterGain) masterGain.gain.rampTo(volumeVal, 0.08);
+  if (masterGain && actx) masterGain.gain.linearRampToValueAtTime(volumeVal, actx.currentTime + 0.08);
 }
 
 /* =============================================================
@@ -747,9 +884,8 @@ document.addEventListener('touchstart', () => { if (!audioOK) initAudio(); }, { 
 function draw(time) {
   requestAnimationFrame(draw);
 
-  // Late-attach synths — only when context is actually running so
-  // triggerAttack doesn't schedule into a stale currentTime.
-  if (masterGain && typeof Tone !== 'undefined' && Tone.context.rawContext.state === 'running') {
+  // Late-attach synths — only when context is running
+  if (masterGain && actx && actx.state === 'running') {
     shapes.forEach(s => { if (!s.synth && !s.isPalette) attachSynth(s); });
   }
 
