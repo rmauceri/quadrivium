@@ -47,6 +47,19 @@ Only `touchstart` and `click` are valid user activations for AudioContext on tou
 | `.rampTo()` | `param.linearRampToValueAtTime()` |
 | `.toDestination()` | `node.connect(actx.destination)` |
 
+## Current audio architecture (post-session)
+
+### Signal chain
+Each synth → per-shape `GainNode` (volume knob) → `masterGain` → dry/wet split:
+- Dry: `GainNode(0.75)` → `destination`
+- Wet: `ConvolverNode` (generated IR, 3.5s decay) → `GainNode(0.35)` → `destination`
+
+### Anti-drone design
+Tonal shapes (circle, triangle, pentagon) use **swell cycling** — each independently fades in over 3-7s, holds 2-5s, fades to near-silence over 3-7s, rests 2-7s, then repeats. All timings randomized per cycle. Additional slow pitch drift (~10 cents) and FM depth modulation prevent static timbre.
+
+### Per-shape volume
+Edge-drag on shape rim rotates a volume knob (3 full turns = full range). Mouse wheel also works. `volAngle` property on each shape, mapped: `clamp(1 + volAngle / (3π), 0, 2)`.
+
 ## Files
 
 - `index.html` — the entire app, single file
