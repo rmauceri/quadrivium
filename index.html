@@ -29,7 +29,14 @@ canvas { display: block; touch-action: none; }
 <div id="overlay"><span>touch to begin</span></div>
 
 <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js"></script>
+<script>
+// Prefetch Tone.js source but DON'T execute — we'll eval it inside
+// the first gesture handler so its AudioContext is born gesture-blessed.
+var _toneSource = null;
+fetch('https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js')
+  .then(function(r) { return r.text(); })
+  .then(function(src) { _toneSource = src; });
+</script>
 <script>
 'use strict';
 
@@ -116,20 +123,18 @@ function pxDist(a, b) {
 
 function initAudio() {
   if (audioOK) return;
+  if (!_toneSource) return;   // CDN hasn't delivered yet — next tap will retry
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // iOS-safe: create a raw AudioContext synchronously in the gesture
-  // handler, then hand it to Tone.js.  This is the proven wunderkammer
-  // pattern — the context is "gesture-blessed" because it was born here.
-  const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (rawCtx.state === 'suspended') rawCtx.resume();
-  Tone.setContext(rawCtx);
+  // Execute Tone.js NOW, synchronously inside the gesture handler.
+  // Its AudioContext is created HERE — born gesture-blessed — so strict
+  // mobile browsers (iOS Safari, mobile Chrome) will allow it to run.
+  // No setContext, no fighting the framework.
+  (0, eval)(_toneSource);
+  _toneSource = null;         // free the source string
 
-  // Fire-and-forget — context is already running, no need to await
   Tone.start();
-
-  // Build entire audio graph synchronously
   Tone.Transport.bpm.value = 120;
   Tone.Transport.start();
   masterGain = new Tone.Gain(volumeVal).toDestination();
@@ -140,7 +145,8 @@ function initAudio() {
   // iOS 17.5+ visibility bug — context gets interrupted on tab switch
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      if (rawCtx.state !== 'running') rawCtx.resume();
+      const raw = Tone.context.rawContext;
+      if (raw && raw.state !== 'running') raw.resume();
     }
   });
 }
@@ -183,9 +189,8 @@ function attachSynth(shape) {
       const loop = new Tone.Loop((time) => {
         tick.triggerAttackRelease('16n', time);
       }, rate);
-      loop.start(0);
+      loop.start();
       extras.push(loop);
-      if (Tone.Transport.state !== 'started') Tone.Transport.start();
       synth = { _isRhythm: true, _src: tick, _loop: loop, volume: tick.volume };
       shape.synth = synth;
       shape.extras = extras;
@@ -213,9 +218,8 @@ function attachSynth(shape) {
       const loop = new Tone.Loop((time) => {
         kick.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', time);
       }, rate);
-      loop.start(0);
+      loop.start();
       extras.push(loop);
-      if (Tone.Transport.state !== 'started') Tone.Transport.start();
       synth = { _isRhythm: true, _src: kick, _loop: loop, volume: kick.volume };
       shape.synth = synth;
       shape.extras = extras;
