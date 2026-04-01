@@ -119,12 +119,26 @@ async function startAudio() {
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  await Tone.start();
+  // iOS Safari: native audio unlock before Tone
+  try {
+    const snd = new Audio('data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4Ljc2LjEwMAAAAAAAAAAAAAAA/+M4wAAAAAAAAAAAAEluZm8AAAAPAAAAAgAAAbAAqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq//////////////////////////////////////////////////////////////////8AAAAATGF2YzU4LjEzAAAAAAAAAAAAAAAAJAAAAAAAAAAAAbC8s5LGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/+M4wAAAAAAA0gAAAAATEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/4zjAAAAAAAANIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+    snd.volume = 0.01;
+    await snd.play();
+    snd.pause();
+  } catch(_){}
 
-  masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 }).toDestination();
-  masterGain = new Tone.Gain(volumeVal).connect(masterVerb);
+  await Tone.start();
+  Tone.Transport.start();
+
+  // Build audio graph — do NOT await reverb before first sound
+  masterGain = new Tone.Gain(volumeVal).toDestination();
   masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterGain);
-  await masterVerb.ready;
+
+  // Reverb connects async — first notes play dry, reverb fades in when ready
+  masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
+  masterVerb.ready.then(() => {
+    try { masterVerb.connect(Tone.Destination); masterGain.disconnect(); masterGain.connect(masterVerb); } catch(_){}
+  }).catch(() => {});
 
   shapes.forEach(s => attachSynth(s));
   recomputeProximity();
@@ -192,11 +206,12 @@ function attachSynth(shape) {
       break;
     }
     case 'hexagon': {
-      // Deep kick drum pulse
-      const gain = new Tone.Gain(0.6).connect(masterComp);
+      // Deep kick drum pulse — prominent even solo
+      const gain = new Tone.Gain(1.2).connect(masterComp);
       const memSynth = new Tone.MembraneSynth({
-        pitchDecay: 0.05, octaves: 4,
-        envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 }
+        pitchDecay: 0.08, octaves: 6,
+        envelope: { attack: 0.001, decay: 0.45, sustain: 0, release: 0.5 },
+        volume: -4
       });
       memSynth.connect(gain);
       extras.push(gain);
