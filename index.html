@@ -29,14 +29,7 @@ canvas { display: block; touch-action: none; }
 <div id="overlay"><span>touch to begin</span></div>
 
 <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js"></script>
-<script>
-// Prefetch Tone.js source but DON'T execute — we'll eval it inside
-// the first gesture handler so its AudioContext is born gesture-blessed.
-var _toneSource = null;
-fetch('https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js')
-  .then(function(r) { return r.text(); })
-  .then(function(src) { _toneSource = src; });
-</script>
+<script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js"></script>
 <script>
 'use strict';
 
@@ -121,68 +114,48 @@ function pxDist(a, b) {
    AUDIO ENGINE
    ============================================================= */
 
-function initAudio() {
+async function initAudio() {
   if (audioOK) return;
-  if (!_toneSource) return;   // CDN hasn't delivered yet — next tap will retry
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // Execute Tone.js NOW, synchronously inside the gesture handler.
-  // Its AudioContext is created HERE — born gesture-blessed — so strict
-  // mobile browsers (iOS Safari, mobile Chrome) will allow it to run.
-  // No setContext, no fighting the framework.
-  (0, eval)(_toneSource);
-  _toneSource = null;         // free the source string
+  // Create a raw AudioContext DIRECTLY in the gesture handler —
+  // this is the only way to get a gesture-blessed context on
+  // strict mobile browsers.  Then hand it to Tone.js.
+  const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (rawCtx.state === 'suspended') rawCtx.resume();
+  Tone.setContext(rawCtx);
 
-  Tone.start();
-  Tone.Transport.bpm.value = 120;
-  Tone.Transport.start();
-  masterGain = new Tone.Gain(volumeVal).toDestination();
+  // await ensures the context is fully running before we build
+  // the graph — this is critical for Transport and triggerAttack.
+  // Called without await from onDown, so the gesture handler
+  // returns immediately; the graph builds asynchronously once
+  // the context is confirmed running.
+  await Tone.start();
 
   // DEBUG — temporary diagnostics
-  const raw = Tone.context.rawContext;
   const dbg = document.createElement('div');
   dbg.id = 'dbg';
   dbg.style.cssText = 'position:fixed;top:0;left:0;background:rgba(0,0,0,0.8);color:#0f0;font:12px monospace;padding:6px;z-index:9999;white-space:pre';
   document.body.appendChild(dbg);
   function updateDbg(msg) {
-    dbg.textContent = `ctx: ${raw.state} | t: ${raw.currentTime.toFixed(2)} | shapes: ${shapes.filter(s=>s.synth&&!s.isPalette).length}/${shapes.filter(s=>!s.isPalette).length}\n${msg}`;
+    dbg.textContent = `ctx: ${rawCtx.state} | t: ${rawCtx.currentTime.toFixed(2)} | shapes: ${shapes.filter(s=>s.synth&&!s.isPalette).length}/${shapes.filter(s=>!s.isPalette).length}\n${msg}`;
   }
-  updateDbg('init');
-  raw.addEventListener('statechange', () => updateDbg('statechange → ' + raw.state));
   setInterval(() => updateDbg('poll'), 500);
 
-  // Attach synths only once the context is actually running
-  if (raw.state === 'running') {
-    updateDbg('immediate attach (running)');
-    shapes.forEach(s => attachSynth(s));
-    recomputeProximity();
-  } else {
-    updateDbg('waiting for statechange...');
-    raw.addEventListener('statechange', function onRunning() {
-      if (raw.state === 'running') {
-        raw.removeEventListener('statechange', onRunning);
-        updateDbg('statechange attach');
-        shapes.forEach(s => attachSynth(s));
-        recomputeProximity();
-      }
-    });
-    // Fallback: poll in case statechange never fires
-    const poll = setInterval(() => {
-      if (raw.state === 'running') {
-        clearInterval(poll);
-        updateDbg('poll attach');
-        shapes.forEach(s => { if (!s.synth && !s.isPalette) attachSynth(s); });
-        recomputeProximity();
-      }
-    }, 100);
-  }
+  updateDbg('post-await, building graph');
+  Tone.Transport.bpm.value = 120;
+  Tone.Transport.start();
+  masterGain = new Tone.Gain(volumeVal).toDestination();
+
+  shapes.forEach(s => attachSynth(s));
+  recomputeProximity();
+  updateDbg('graph built, synths attached');
 
   // iOS 17.5+ visibility bug — context gets interrupted on tab switch
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
-      const raw = Tone.context.rawContext;
-      if (raw && raw.state !== 'running') raw.resume();
+      if (rawCtx.state !== 'running') rawCtx.resume();
     }
   });
 }
