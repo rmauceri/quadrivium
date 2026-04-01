@@ -67,7 +67,7 @@ let audioOK  = false;
 let tapTime  = 0, tapId = -1;
 let proxPairs = [];
 let nextId   = 1;
-let volumeVal = 0.7;
+let volumeVal = 0.3;
 let volDrag   = false;
 
 let grainCvs, tableCvs;
@@ -971,10 +971,15 @@ function initPalette() {
 
 function initScene() {
   shapes = [];
-  // Three shapes: circle + triangle close together, pentagon alone
-  shapes.push(makeShape('circle',   0.32 + Math.random() * 0.03, 0.38 + Math.random() * 0.03, false));
-  shapes.push(makeShape('triangle', 0.52 + Math.random() * 0.03, 0.33 + Math.random() * 0.03, false));
-  shapes.push(makeShape('pentagon', 0.70 + Math.random() * 0.03, 0.62 + Math.random() * 0.03, false));
+  // 3 random shapes at random positions each load
+  const pool = TYPES.slice();
+  for (let i = 0; i < 3; i++) {
+    const idx = Math.floor(Math.random() * pool.length);
+    const type = pool.splice(idx, 1)[0];
+    const x = 0.15 + Math.random() * 0.70;
+    const y = 0.15 + Math.random() * 0.55;
+    shapes.push(makeShape(type, x, y, false));
+  }
   recomputeProximity();
 }
 
