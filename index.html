@@ -40,7 +40,7 @@ const SHAPE_DEFS = {
 };
 
 const TYPES       = Object.keys(SHAPE_DEFS);
-const BASE_SIZE   = 0.065;
+const BASE_SIZE   = 0.085;
 const SIZE_VARY   = 0.012;
 const PAL_SCALE   = 0.55;
 const PAL_Y       = 0.93;
@@ -69,7 +69,6 @@ let proxPairs = [];
 let nextId   = 1;
 let volumeVal = 0.7;
 let volDrag   = false;
-let twist     = null;  // { shape, startAngle, startVolAngle }
 
 let grainCvs, tableCvs;
 let masterGain;
@@ -756,17 +755,22 @@ function updateVolFromY(py) {
    ============================================================= */
 
 function hitTest(px, py) {
+  const EDGE_INNER = 0.55;  // fraction of hit radius — inside this is 'center'
   for (let i = shapes.length - 1; i >= 0; i--) {
     const s = shapes[i];
     const dx = px - s.x * W, dy = py - s.y * H;
+    const dist = Math.sqrt(dx * dx + dy * dy);
     const hr = Math.max(s.size * unit * 0.55, MIN_HIT);
-    if (dx * dx + dy * dy < hr * hr) return { shape: s, from: 'shape' };
+    if (dist < hr) {
+      const zone = dist > hr * EDGE_INNER ? 'edge' : 'center';
+      return { shape: s, from: 'shape', zone };
+    }
   }
   for (let i = palette.length - 1; i >= 0; i--) {
     const s = palette[i];
     const dx = px - s.x * W, dy = py - s.y * H;
     const hr = Math.max(s.size * unit * 0.55, MIN_HIT);
-    if (dx * dx + dy * dy < hr * hr) return { shape: s, from: 'palette' };
+    if (dx * dx + dy * dy < hr * hr) return { shape: s, from: 'palette', zone: 'center' };
   }
   return null;
 }
@@ -791,8 +795,8 @@ function onDown(e) {
 
   const hit = hitTest(px, py);
 
-  // Double-tap → remove
-  if (hit && hit.from === 'shape') {
+  // Double-tap center → remove (edge taps don't count — those are volume knob)
+  if (hit && hit.from === 'shape' && hit.zone === 'center') {
     const now = performance.now();
     if (tapId === hit.shape.id && now - tapTime < DBL_TAP_MS) {
       removeShape(hit.shape);
@@ -811,6 +815,13 @@ function onDown(e) {
     shapes.push(ns);
     if (masterGain) attachSynth(ns);
     drag = { shape: ns, ox: 0, oy: 0, fromPal: true };
+  } else if (hit.zone === 'edge') {
+    // Edge drag → rotate = volume knob
+    const angle = Math.atan2(py - hit.shape.y * H, px - hit.shape.x * W);
+    drag = { shape: hit.shape, mode: 'rotate', startAngle: angle, startVolAngle: hit.shape.volAngle };
+    // Raise to top
+    const idx = shapes.indexOf(hit.shape);
+    if (idx >= 0) { shapes.splice(idx, 1); shapes.push(hit.shape); }
   } else {
     drag = {
       shape: hit.shape,
@@ -836,11 +847,21 @@ function onMove(e) {
   const s = drag.shape;
   const mx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
   const my = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
-  s.x = clamp(mx / W + drag.ox, 0.03, 0.97);
-  s.y = clamp(my / H + drag.oy, 0.03, 0.97);
 
-  updateShapeAudio(s);
-  recomputeProximity();
+  if (drag.mode === 'rotate') {
+    // Edge-drag rotation → volume knob
+    const angle = Math.atan2(my - s.y * H, mx - s.x * W);
+    let delta = angle - drag.startAngle;
+    while (delta > Math.PI) delta -= Math.PI * 2;
+    while (delta < -Math.PI) delta += Math.PI * 2;
+    s.volAngle = clamp(drag.startVolAngle + delta, -Math.PI, Math.PI);
+    if (s.synth) s.synth.setVol(shapeVolume(s));
+  } else {
+    s.x = clamp(mx / W + drag.ox, 0.03, 0.97);
+    s.y = clamp(my / H + drag.oy, 0.03, 0.97);
+    updateShapeAudio(s);
+    recomputeProximity();
+  }
 }
 
 function onUp(e) {
@@ -869,42 +890,7 @@ cvs.addEventListener('pointercancel', () => { drag = null; });
 cvs.addEventListener('touchstart', (e) => {
   if (!audioOK) { initAudio(); e.preventDefault(); }
   if (actx && actx.state !== 'running') actx.resume();
-
-  // Two-finger twist → per-shape volume knob
-  if (e.touches.length === 2) {
-    e.preventDefault();
-    drag = null;  // cancel any single-finger drag
-    const t0 = e.touches[0], t1 = e.touches[1];
-    const cx = (t0.clientX + t1.clientX) / 2;
-    const cy = (t0.clientY + t1.clientY) / 2;
-    const angle = Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX);
-    // Find shape under midpoint of the two fingers
-    const hit = hitTest(cx, cy);
-    if (hit && hit.from === 'shape') {
-      twist = { shape: hit.shape, startAngle: angle, startVolAngle: hit.shape.volAngle };
-      tapId = -1; tapTime = 0;  // suppress double-tap from two-finger touch
-    }
-  }
 }, { passive: false });
-
-cvs.addEventListener('touchmove', (e) => {
-  if (twist && e.touches.length === 2) {
-    e.preventDefault();
-    const t0 = e.touches[0], t1 = e.touches[1];
-    const angle = Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX);
-    let delta = angle - twist.startAngle;
-    // Normalize delta to -PI..PI
-    while (delta > Math.PI) delta -= Math.PI * 2;
-    while (delta < -Math.PI) delta += Math.PI * 2;
-    twist.shape.volAngle = clamp(twist.startVolAngle + delta, -Math.PI, Math.PI);
-    if (twist.shape.synth) {
-      twist.shape.synth.setVol(shapeVolume(twist.shape));
-    }
-  }
-}, { passive: false });
-
-cvs.addEventListener('touchend', () => { twist = null; });
-cvs.addEventListener('touchcancel', () => { twist = null; });
 
 // Mouse wheel → per-shape volume knob (hover over shape and scroll)
 cvs.addEventListener('wheel', (e) => {
