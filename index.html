@@ -87,7 +87,7 @@ let volumeVal = 0.7;
 let volDrag   = false;
 
 let grainCvs, tableCvs;
-let masterComp, masterVerb, masterGain;
+let masterGain;
 
 /* =============================================================
    UTILITY
@@ -114,37 +114,28 @@ function pxDist(a, b) {
    AUDIO ENGINE
    ============================================================= */
 
-function initAudio() {
+async function initAudio() {
   if (audioOK) return;
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // Synchronous AudioContext — works on iOS/Android/desktop
+  // Create raw AudioContext for iOS compatibility
   const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (rawCtx.state === 'suspended') rawCtx.resume();
   Tone.setContext(rawCtx);
 
-  // Must await Tone.start before Transport works reliably
-  Tone.start().then(() => {
-    Tone.Transport.start();
+  await Tone.start();
+  Tone.Transport.start();
 
-    masterGain = new Tone.Gain(volumeVal).toDestination();
-    masterComp = new Tone.Compressor({ threshold: -18, ratio: 2.5, attack: 0.05, release: 0.25 }).connect(masterGain);
+  masterGain = new Tone.Gain(volumeVal).toDestination();
 
-    // Reverb setup — non-blocking, but don't disconnect masterGain
-    masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
-    masterVerb.ready.then(() => {
-      try { masterComp.connect(masterVerb); } catch(_){}
-    }).catch(() => {});
-
-    // Attach synths to any shapes already on the table
-    shapes.forEach(s => attachSynth(s));
-    recomputeProximity();
-  }).catch(() => { audioOK = false; });
+  // Attach synths to initial shapes
+  shapes.forEach(s => attachSynth(s));
+  recomputeProximity();
 }
 
 function attachSynth(shape) {
-  if (shape.synth || shape.isPalette || !masterComp) return;
+  if (shape.synth || shape.isPalette || !masterGain) return;
   let synth, extras = [];
 
   switch (shape.type) {
@@ -155,7 +146,7 @@ function attachSynth(shape) {
       });
       const tr = new Tone.Tremolo({ frequency: 0.15, depth: 0.18 }).start();
       extras.push(tr);
-      synth.chain(tr, masterComp);
+      synth.chain(tr, masterGain);
       break;
     }
     case 'triangle': {
@@ -167,26 +158,23 @@ function attachSynth(shape) {
       });
       const ch = new Tone.Chorus({ frequency: 0.8, depth: 0.4, wet: 0.3 }).start();
       extras.push(ch);
-      synth.chain(ch, masterComp);
+      synth.chain(ch, masterGain);
       break;
     }
     case 'square': {
-      // Percussive tick — short noise burst on a loop
       const tick = new Tone.NoiseSynth({
         noise: { type: 'white' },
         envelope: { attack: 0.001, decay: 0.05, sustain: 0, release: 0.02 },
-        volume: -6
+        volume: -4
       });
-      const filt = new Tone.Filter({ frequency: 5000, type: 'bandpass', Q: 2 });
-      tick.chain(filt, masterComp);
-      extras.push(filt);
+      tick.connect(masterGain);
       const rate = 0.2 + shape.x * 0.8;
       const loop = new Tone.Loop((time) => {
         tick.triggerAttackRelease('32n', time);
       }, rate);
       loop.start();
       extras.push(loop);
-      synth = { _isRhythm: true, _src: tick, _loop: loop, _filt: filt, volume: tick.volume };
+      synth = { _isRhythm: true, _src: tick, _loop: loop, volume: tick.volume };
       shape.synth = synth;
       shape.extras = extras;
       return;
@@ -198,17 +186,16 @@ function attachSynth(shape) {
       });
       const ph = new Tone.Phaser({ frequency: 0.15, octaves: 2, wet: 0.25 });
       extras.push(ph);
-      synth.chain(ph, masterComp);
+      synth.chain(ph, masterGain);
       break;
     }
     case 'hexagon': {
-      // Kick drum — MembraneSynth is purpose-built for this
       const kick = new Tone.MembraneSynth({
         pitchDecay: 0.05, octaves: 6,
         envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 },
         volume: 0
       });
-      kick.connect(masterComp);
+      kick.connect(masterGain);
       extras = [];
       const rate = 0.4 + shape.x * 1.6;
       const loop = new Tone.Loop((time) => {
@@ -239,7 +226,6 @@ function detachSynth(shape) {
     s.volume.rampTo(-60, 0.5);
     setTimeout(() => {
       try { if (s._src) s._src.dispose(); } catch(_){}
-      try { if (s._filt) s._filt.dispose(); } catch(_){}
       ex.forEach(e => { try { e.dispose(); } catch(_){} });
     }, 600);
   } else {
@@ -261,7 +247,7 @@ function updateShapeAudio(shape) {
       const rate = shape.type === 'square'
         ? (0.2 + shape.x * 0.8)
         : (0.4 + shape.x * 1.6);
-      shape.synth._loop.interval = rate; // number, not string
+      shape.synth._loop.interval = rate;
     }
     if (shape.synth._src && shape.synth._src.frequency) {
       shape.synth._src.frequency.value = pitchFromY(shape.y) * 0.5;
@@ -627,12 +613,13 @@ function hitTest(px, py) {
   return null;
 }
 
-function onDown(e) {
+async function onDown(e) {
   e.preventDefault();
   if (e.pointerId != null) cvs.setPointerCapture(e.pointerId);
 
-  // First touch: init audio. Interaction still works this same tap.
-  if (!audioOK) initAudio();
+  // First touch: init audio, then continue with interaction
+  if (!audioOK) await initAudio();
+  if (!masterGain) return;
 
   const px = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
   const py = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
@@ -664,7 +651,7 @@ function onDown(e) {
     const tmpl = hit.shape;
     const ns = makeShape(tmpl.type, tmpl.x, tmpl.y, false);
     shapes.push(ns);
-    if (masterComp) attachSynth(ns);
+    if (masterGain) attachSynth(ns);
     drag = { shape: ns, ox: 0, oy: 0, fromPal: true };
   } else {
     drag = {
