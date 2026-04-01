@@ -124,8 +124,8 @@ function initAudio() {
   if (rawCtx.state === 'suspended') rawCtx.resume();
   Tone.setContext(rawCtx);
 
-  // Tone.start returns a promise but the raw context is already running
-  Tone.start().catch(() => {});
+  // Build audio graph immediately — raw context is already running
+  try { Tone.start(); } catch(_){}
   Tone.Transport.start();
 
   masterGain = new Tone.Gain(volumeVal).toDestination();
@@ -181,13 +181,13 @@ function attachSynth(shape) {
         volume: -6
       });
       const filt = new Tone.Filter({ frequency: 5000, type: 'bandpass', Q: 2 });
-      tick.chain(filt, masterGain); // direct to master, skip compressor
+      tick.chain(filt, masterGain);
       extras.push(filt);
       const rate = 0.2 + shape.x * 0.8;
       const loop = new Tone.Loop((time) => {
         tick.triggerAttackRelease('32n', time);
       }, rate);
-      loop.start(0);
+      loop.start();
       extras.push(loop);
       synth = { _isRhythm: true, _src: tick, _loop: loop, _filt: filt, volume: tick.volume };
       shape.synth = synth;
@@ -211,13 +211,13 @@ function attachSynth(shape) {
         envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 },
         volume: 0
       });
-      kick.connect(masterGain); // direct to master, skip compressor
+      kick.connect(masterGain);
       extras = [];
       const rate = 0.4 + shape.x * 1.6;
       const loop = new Tone.Loop((time) => {
         kick.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', time);
       }, rate);
-      loop.start(0);
+      loop.start();
       extras.push(loop);
       synth = { _isRhythm: true, _src: kick, _loop: loop, volume: kick.volume };
       shape.synth = synth;
