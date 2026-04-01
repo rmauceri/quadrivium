@@ -31,10 +31,6 @@ canvas { display: block; touch-action: none; }
 <script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js"></script>
 <script>
-// Immediately close Tone's auto-created context so it doesn't interfere
-try { Tone.context.rawContext.close(); } catch(_){}
-</script>
-<script>
 'use strict';
 
 /* =============================================================
@@ -118,7 +114,7 @@ function pxDist(a, b) {
    AUDIO ENGINE
    ============================================================= */
 
-async function initAudio() {
+function initAudio() {
   if (audioOK) return;
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
@@ -128,14 +124,14 @@ async function initAudio() {
   if (rawCtx.state === 'suspended') rawCtx.resume();
   Tone.setContext(rawCtx);
 
-  await Tone.start();
-  Tone.Transport.start();
+  Tone.start().then(() => {
+    Tone.Transport.start();
+    masterGain = new Tone.Gain(volumeVal).toDestination();
 
-  masterGain = new Tone.Gain(volumeVal).toDestination();
-
-  // Attach synths to initial shapes
-  shapes.forEach(s => attachSynth(s));
-  recomputeProximity();
+    // Attach synths to initial shapes
+    shapes.forEach(s => attachSynth(s));
+    recomputeProximity();
+  });
 }
 
 function attachSynth(shape) {
@@ -617,13 +613,12 @@ function hitTest(px, py) {
   return null;
 }
 
-async function onDown(e) {
+function onDown(e) {
   e.preventDefault();
   if (e.pointerId != null) cvs.setPointerCapture(e.pointerId);
 
-  // First touch: init audio, then continue with interaction
-  if (!audioOK) await initAudio();
-  if (!masterGain) return;
+  // First touch: start audio init (non-blocking)
+  if (!audioOK) initAudio();
 
   const px = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
   const py = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
@@ -720,6 +715,11 @@ cvs.addEventListener('touchstart', (e) => {
 
 function draw(time) {
   requestAnimationFrame(draw);
+
+  // Late-attach synths for shapes created before audio was ready
+  if (masterGain) {
+    shapes.forEach(s => { if (!s.synth && !s.isPalette) attachSynth(s); });
+  }
 
   // Background
   ctx.fillStyle = BG;
