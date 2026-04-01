@@ -92,11 +92,11 @@ function volFromSize(sz) {
 }
 
 function shapeVolume(shape) {
-  // Base volume from size, scaled by volAngle knob.
-  // volAngle range: -PI..+PI  →  volume multiplier: 0..2
-  // At volAngle=0 (default), multiplier = 1.
+  // volAngle range: -3PI..+3PI  →  volume multiplier: 0..2
+  // 3 full turns CW = max, 3 CCW = mute. Default (0) = 1x.
+  const VOL_TURNS = 3;
   const base = volFromSize(shape.size);
-  const knob = clamp(1 + shape.volAngle / Math.PI, 0, 2);
+  const knob = clamp(1 + shape.volAngle / (VOL_TURNS * Math.PI), 0, 2);
   return base * knob;
 }
 
@@ -816,9 +816,9 @@ function onDown(e) {
     if (masterGain) attachSynth(ns);
     drag = { shape: ns, ox: 0, oy: 0, fromPal: true };
   } else if (hit.zone === 'edge') {
-    // Edge drag → rotate = volume knob
+    // Edge drag → rotate = volume knob (incremental accumulation for multi-turn)
     const angle = Math.atan2(py - hit.shape.y * H, px - hit.shape.x * W);
-    drag = { shape: hit.shape, mode: 'rotate', startAngle: angle, startVolAngle: hit.shape.volAngle };
+    drag = { shape: hit.shape, mode: 'rotate', prevAngle: angle };
     // Raise to top
     const idx = shapes.indexOf(hit.shape);
     if (idx >= 0) { shapes.splice(idx, 1); shapes.push(hit.shape); }
@@ -849,12 +849,13 @@ function onMove(e) {
   const my = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
 
   if (drag.mode === 'rotate') {
-    // Edge-drag rotation → volume knob
+    const VOL_MAX = 3 * Math.PI;
     const angle = Math.atan2(my - s.y * H, mx - s.x * W);
-    let delta = angle - drag.startAngle;
+    let delta = angle - drag.prevAngle;
     while (delta > Math.PI) delta -= Math.PI * 2;
     while (delta < -Math.PI) delta += Math.PI * 2;
-    s.volAngle = clamp(drag.startVolAngle + delta, -Math.PI, Math.PI);
+    s.volAngle = clamp(s.volAngle + delta, -VOL_MAX, VOL_MAX);
+    drag.prevAngle = angle;
     if (s.synth) s.synth.setVol(shapeVolume(s));
   } else {
     s.x = clamp(mx / W + drag.ox, 0.03, 0.97);
@@ -899,7 +900,7 @@ cvs.addEventListener('wheel', (e) => {
     e.preventDefault();
     const s = hit.shape;
     // deltaY > 0 = scroll down = quieter (counterclockwise)
-    s.volAngle = clamp(s.volAngle - e.deltaY * 0.003, -Math.PI, Math.PI);
+    s.volAngle = clamp(s.volAngle - e.deltaY * 0.009, -3 * Math.PI, 3 * Math.PI);
     if (s.synth) s.synth.setVol(shapeVolume(s));
   }
 }, { passive: false });
