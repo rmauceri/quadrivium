@@ -119,16 +119,29 @@ function initAudio() {
   audioOK = true;
   document.getElementById('overlay').classList.add('hidden');
 
-  // Let Tone.js manage its own AudioContext — don't fight it.
-  // Tone.start() handles iOS/Safari gesture-unlock internally.
-  Tone.start().then(() => {
-    Tone.Transport.bpm.value = 120;
-    Tone.Transport.start();
-    masterGain = new Tone.Gain(volumeVal).toDestination();
+  // iOS-safe: create a raw AudioContext synchronously in the gesture
+  // handler, then hand it to Tone.js.  This is the proven wunderkammer
+  // pattern — the context is "gesture-blessed" because it was born here.
+  const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (rawCtx.state === 'suspended') rawCtx.resume();
+  Tone.setContext(rawCtx);
 
-    // Attach synths to initial shapes
-    shapes.forEach(s => attachSynth(s));
-    recomputeProximity();
+  // Fire-and-forget — context is already running, no need to await
+  Tone.start();
+
+  // Build entire audio graph synchronously
+  Tone.Transport.bpm.value = 120;
+  Tone.Transport.start();
+  masterGain = new Tone.Gain(volumeVal).toDestination();
+
+  shapes.forEach(s => attachSynth(s));
+  recomputeProximity();
+
+  // iOS 17.5+ visibility bug — context gets interrupted on tab switch
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      if (rawCtx.state !== 'running') rawCtx.resume();
+    }
   });
 }
 
@@ -170,8 +183,9 @@ function attachSynth(shape) {
       const loop = new Tone.Loop((time) => {
         tick.triggerAttackRelease('16n', time);
       }, rate);
-      loop.start();
+      loop.start(0);
       extras.push(loop);
+      if (Tone.Transport.state !== 'started') Tone.Transport.start();
       synth = { _isRhythm: true, _src: tick, _loop: loop, volume: tick.volume };
       shape.synth = synth;
       shape.extras = extras;
@@ -199,8 +213,9 @@ function attachSynth(shape) {
       const loop = new Tone.Loop((time) => {
         kick.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', time);
       }, rate);
-      loop.start();
+      loop.start(0);
       extras.push(loop);
+      if (Tone.Transport.state !== 'started') Tone.Transport.start();
       synth = { _isRhythm: true, _src: kick, _loop: loop, volume: kick.volume };
       shape.synth = synth;
       shape.extras = extras;
@@ -612,11 +627,12 @@ function hitTest(px, py) {
 }
 
 function onDown(e) {
+  // Audio init BEFORE preventDefault — some browsers consider
+  // preventDefault as breaking the gesture chain for audio unlock.
+  if (!audioOK) initAudio();
+
   e.preventDefault();
   if (e.pointerId != null) cvs.setPointerCapture(e.pointerId);
-
-  // First touch: start audio init (non-blocking)
-  if (!audioOK) initAudio();
 
   const px = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
   const py = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
@@ -706,6 +722,10 @@ cvs.addEventListener('pointercancel', () => { drag = null; });
 cvs.addEventListener('touchstart', (e) => {
   if (!audioOK) { initAudio(); e.preventDefault(); }
 }, { passive: false });
+
+// Document-level fallback unlock — catches taps outside the canvas
+document.addEventListener('click', () => { if (!audioOK) initAudio(); }, { once: true });
+document.addEventListener('touchstart', () => { if (!audioOK) initAudio(); }, { once: true });
 
 /* =============================================================
    SCENE DRAWING
