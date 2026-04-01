@@ -139,8 +139,22 @@ function initAudio() {
   Tone.Transport.start();
   masterGain = new Tone.Gain(volumeVal).toDestination();
 
-  shapes.forEach(s => attachSynth(s));
-  recomputeProximity();
+  // Attach synths only once the context is actually running —
+  // triggerAttack on a suspended context schedules at currentTime=0
+  // which lands in the past once the context resumes → silent.
+  const raw = Tone.context.rawContext;
+  if (raw.state === 'running') {
+    shapes.forEach(s => attachSynth(s));
+    recomputeProximity();
+  } else {
+    raw.addEventListener('statechange', function onRunning() {
+      if (raw.state === 'running') {
+        raw.removeEventListener('statechange', onRunning);
+        shapes.forEach(s => attachSynth(s));
+        recomputeProximity();
+      }
+    });
+  }
 
   // iOS 17.5+ visibility bug — context gets interrupted on tab switch
   document.addEventListener('visibilitychange', () => {
