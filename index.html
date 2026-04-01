@@ -752,8 +752,9 @@ document.addEventListener('touchstart', () => { if (!audioOK) initAudio(); }, { 
 function draw(time) {
   requestAnimationFrame(draw);
 
-  // Late-attach synths for shapes created before audio was ready
-  if (masterGain) {
+  // Late-attach synths — only when context is actually running so
+  // triggerAttack doesn't schedule into a stale currentTime.
+  if (masterGain && typeof Tone !== 'undefined' && Tone.context.rawContext.state === 'running') {
     shapes.forEach(s => { if (!s.synth && !s.isPalette) attachSynth(s); });
   }
 
