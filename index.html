@@ -139,21 +139,43 @@ function initAudio() {
   Tone.Transport.start();
   masterGain = new Tone.Gain(volumeVal).toDestination();
 
-  // Attach synths only once the context is actually running —
-  // triggerAttack on a suspended context schedules at currentTime=0
-  // which lands in the past once the context resumes → silent.
+  // DEBUG — temporary diagnostics
   const raw = Tone.context.rawContext;
+  const dbg = document.createElement('div');
+  dbg.id = 'dbg';
+  dbg.style.cssText = 'position:fixed;top:0;left:0;background:rgba(0,0,0,0.8);color:#0f0;font:12px monospace;padding:6px;z-index:9999;white-space:pre';
+  document.body.appendChild(dbg);
+  function updateDbg(msg) {
+    dbg.textContent = `ctx: ${raw.state} | t: ${raw.currentTime.toFixed(2)} | shapes: ${shapes.filter(s=>s.synth&&!s.isPalette).length}/${shapes.filter(s=>!s.isPalette).length}\n${msg}`;
+  }
+  updateDbg('init');
+  raw.addEventListener('statechange', () => updateDbg('statechange → ' + raw.state));
+  setInterval(() => updateDbg('poll'), 500);
+
+  // Attach synths only once the context is actually running
   if (raw.state === 'running') {
+    updateDbg('immediate attach (running)');
     shapes.forEach(s => attachSynth(s));
     recomputeProximity();
   } else {
+    updateDbg('waiting for statechange...');
     raw.addEventListener('statechange', function onRunning() {
       if (raw.state === 'running') {
         raw.removeEventListener('statechange', onRunning);
+        updateDbg('statechange attach');
         shapes.forEach(s => attachSynth(s));
         recomputeProximity();
       }
     });
+    // Fallback: poll in case statechange never fires
+    const poll = setInterval(() => {
+      if (raw.state === 'running') {
+        clearInterval(poll);
+        updateDbg('poll attach');
+        shapes.forEach(s => { if (!s.synth && !s.isPalette) attachSynth(s); });
+        recomputeProximity();
+      }
+    }, 100);
   }
 
   // iOS 17.5+ visibility bug — context gets interrupted on tab switch
