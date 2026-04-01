@@ -103,7 +103,7 @@ function pitchFromY(y) {
 
 function volFromSize(sz) {
   const t = clamp((sz - 0.04) / 0.04, 0, 1);
-  return -28 + t * 8;
+  return -32 + t * 8;
 }
 
 function pxDist(a, b) {
@@ -171,27 +171,28 @@ function attachSynth(shape) {
       break;
     }
     case 'square': {
-      // Percussive hi-hat / tick pattern
-      const gain = new Tone.Gain(0.5).connect(masterComp);
+      // Percussive tick / rimshot pattern — cuts through drones
+      const gain = new Tone.Gain(1.0).connect(masterComp);
       const noise = new Tone.NoiseSynth({
         noise: { type: 'white' },
-        envelope: { attack: 0.001, decay: 0.06, sustain: 0, release: 0.02 }
+        envelope: { attack: 0.001, decay: 0.08, sustain: 0, release: 0.03 }
       });
-      const bp = new Tone.Filter({ frequency: 6000, type: 'bandpass', Q: 2 });
+      const bp = new Tone.Filter({ frequency: 4500, type: 'bandpass', Q: 3 });
       noise.chain(bp, gain);
       extras.push(gain, bp);
-      const rate = 0.6 + shape.x * 0.8;
-      const loop = new Tone.Loop((t) => { noise.triggerAttackRelease('16n', t); }, `${rate}`);
+      // X controls rate: left=fast (0.15s = 16ths), right=slow (1.0s)
+      const rate = 0.15 + shape.x * 0.85;
+      const loop = new Tone.Loop((t) => { noise.triggerAttackRelease('32n', t); }, `${rate}`);
       loop.start(0);
       extras.push(loop);
       if (Tone.Transport.state !== 'started') Tone.Transport.start();
-      synth = gain; // volume control target
+      synth = gain;
       synth._isRhythm = true;
       synth._noise = noise;
       synth._loop = loop;
       shape.synth = synth;
       shape.extras = extras;
-      synth.gain.value = Tone.dbToGain(volFromSize(shape.size));
+      synth.gain.value = Tone.dbToGain(volFromSize(shape.size)) * 2;
       return;
     }
     case 'pentagon': {
@@ -205,18 +206,28 @@ function attachSynth(shape) {
       break;
     }
     case 'hexagon': {
-      // Deep kick drum pulse — prominent even solo
-      const gain = new Tone.Gain(1.2).connect(masterComp);
+      // Punchy kick — bypasses compressor for impact, wider rate range
+      const gain = new Tone.Gain(1.8).connect(masterGain);
       const memSynth = new Tone.MembraneSynth({
-        pitchDecay: 0.08, octaves: 6,
-        envelope: { attack: 0.001, decay: 0.45, sustain: 0, release: 0.5 },
-        volume: -4
+        pitchDecay: 0.06, octaves: 8,
+        envelope: { attack: 0.002, decay: 0.25, sustain: 0, release: 0.3 },
+        volume: 2
       });
+      // Layer a click transient for attack presence
+      const click = new Tone.NoiseSynth({
+        noise: { type: 'white' },
+        envelope: { attack: 0.001, decay: 0.015, sustain: 0, release: 0.01 }
+      });
+      const clickFilt = new Tone.Filter({ frequency: 3000, type: 'highpass' });
+      const clickGain = new Tone.Gain(0.6);
+      click.chain(clickFilt, clickGain, gain);
       memSynth.connect(gain);
-      extras.push(gain);
-      const rate = 1.2 + shape.x * 1.6;
+      extras.push(gain, clickFilt, clickGain);
+      // X controls rate: left=fast (0.25s), right=slow (2.0s)
+      const rate = 0.25 + shape.x * 1.75;
       const loop = new Tone.Loop((t) => {
-        memSynth.triggerAttackRelease(pitchFromY(shape.y) * 0.25, '8n', t);
+        memSynth.triggerAttackRelease(pitchFromY(shape.y) * 0.5, '8n', t);
+        click.triggerAttackRelease('64n', t);
       }, `${rate}`);
       loop.start(0);
       extras.push(loop);
@@ -224,10 +235,10 @@ function attachSynth(shape) {
       synth = gain;
       synth._isRhythm = true;
       synth._memSynth = memSynth;
+      synth._click = click;
       synth._loop = loop;
       shape.synth = synth;
       shape.extras = extras;
-      synth.gain.value = Tone.dbToGain(volFromSize(shape.size));
       return;
     }
   }
@@ -251,6 +262,7 @@ function detachSynth(shape) {
         ex.forEach(e => { try { e.dispose(); } catch(_){} });
         try { if (s._noise) s._noise.dispose(); } catch(_){}
         try { if (s._memSynth) s._memSynth.dispose(); } catch(_){}
+        try { if (s._click) s._click.dispose(); } catch(_){}
         try { s.dispose(); } catch(_){}
       }, 500);
     }, 650);
@@ -272,13 +284,13 @@ function updateShapeAudio(shape) {
     // Update loop rate for rhythmic shapes: X → rate, Y → pitch
     if (shape.synth._loop) {
       const rate = shape.type === 'square'
-        ? (0.6 + shape.x * 0.8)
-        : (1.2 + shape.x * 1.6);
+        ? (0.15 + shape.x * 0.85)
+        : (0.25 + shape.x * 1.75);
       shape.synth._loop.interval = `${rate}`;
     }
     if (shape.synth._memSynth) {
       // Update kick pitch
-      shape.synth._memSynth.frequency.value = pitchFromY(shape.y) * 0.25;
+      shape.synth._memSynth.frequency.value = pitchFromY(shape.y) * 0.5;
     }
   } else {
     shape.synth.frequency.rampTo(pitchFromY(shape.y), 0.12);
