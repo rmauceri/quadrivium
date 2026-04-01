@@ -182,20 +182,21 @@ function initAudio() {
 // --- Synth builders per shape type ---
 
 // Slow swell cycling: shapes breathe in and out over long periods
-// instead of droning continuously. Returns a cleanup function.
+// instead of droning continuously. Returns controller with pause/resume/stop.
 function startSwellCycle(gainNode, baseVol) {
   let stopped = false;
+  let paused = false;
   let timeout;
 
   function cycle() {
-    if (stopped) return;
+    if (stopped || paused) return;
     const now = actx.currentTime;
-    const rise = 3 + Math.random() * 4;     // 3-7s fade in
-    const hold = 2 + Math.random() * 3;     // 2-5s sustain
-    const fall = 3 + Math.random() * 4;     // 3-7s fade out
-    const rest = 2 + Math.random() * 5;     // 2-7s silence
+    const rise = 3 + Math.random() * 4;
+    const hold = 2 + Math.random() * 3;
+    const fall = 3 + Math.random() * 4;
+    const rest = 2 + Math.random() * 5;
     const peak = baseVol * (0.7 + Math.random() * 0.3);
-    const floor = baseVol * 0.03;           // near-silence, not zero
+    const floor = baseVol * 0.03;
 
     gainNode.gain.cancelScheduledValues(now);
     gainNode.gain.setValueAtTime(gainNode.gain.value, now);
@@ -207,7 +208,23 @@ function startSwellCycle(gainNode, baseVol) {
   }
 
   cycle();
-  return () => { stopped = true; clearTimeout(timeout); };
+  return {
+    pause() {
+      if (paused) return;
+      paused = true;
+      clearTimeout(timeout);
+      const now = actx.currentTime;
+      gainNode.gain.cancelScheduledValues(now);
+      gainNode.gain.setValueAtTime(gainNode.gain.value, now);
+      gainNode.gain.linearRampToValueAtTime(baseVol, now + 0.5);
+    },
+    resume() {
+      if (!paused) return;
+      paused = false;
+      timeout = setTimeout(cycle, 2000 + Math.random() * 3000);
+    },
+    stop() { stopped = true; clearTimeout(timeout); }
+  };
 }
 
 function buildCircleSynth(freq) {
@@ -248,16 +265,16 @@ function buildCircleSynth(freq) {
   gain.connect(masterGain);
   osc.start();
 
-  const stopSwell = startSwellCycle(envelope, 1.0);
+  const swell = startSwellCycle(envelope, 1.0);
 
-  return { osc, gain, envelope, lfo, driftLfo,
+  return { osc, gain, envelope, lfo, driftLfo, swell,
     setFreq(f) {
       osc.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
       driftGain.gain.value = f * 0.006;
     },
     setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
-      stopSwell();
+      swell.stop();
       gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
       setTimeout(() => { osc.stop(); lfo.stop(); driftLfo.stop(); }, 700);
     }
@@ -331,9 +348,9 @@ function buildTriangleSynth(freq) {
   carrier.start();
   mod.start();
 
-  const stopSwell = startSwellCycle(envelope, 1.0);
+  const swell = startSwellCycle(envelope, 1.0);
 
-  return { carrier, mod, modGain, out, envelope, chorusLfo, driftLfo, fmLfo,
+  return { carrier, mod, modGain, out, envelope, chorusLfo, driftLfo, fmLfo, swell,
     setFreq(f) {
       carrier.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
       mod.frequency.linearRampToValueAtTime(f * 3, actx.currentTime + 0.12);
@@ -343,7 +360,7 @@ function buildTriangleSynth(freq) {
     },
     setVol(v) { out.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
-      stopSwell();
+      swell.stop();
       out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
       setTimeout(() => { carrier.stop(); mod.stop(); chorusLfo.stop(); driftLfo.stop(); fmLfo.stop(); }, 700);
     }
@@ -453,15 +470,15 @@ function buildPentagonSynth(freq) {
   envelope.connect(mix);
   mix.connect(masterGain);
 
-  const stopSwell = startSwellCycle(envelope, 1.0);
+  const swell = startSwellCycle(envelope, 1.0);
 
-  return { oscs, out, mix, envelope, phaserLfo, driftLfos,
+  return { oscs, out, mix, envelope, phaserLfo, driftLfos, swell,
     setFreq(f) {
       oscs.forEach(o => o.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12));
     },
     setVol(v) { mix.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
     destroy() {
-      stopSwell();
+      swell.stop();
       mix.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
       setTimeout(() => {
         oscs.forEach(o => o.stop());
@@ -532,6 +549,13 @@ function buildHexagonSynth(shape) {
       setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
     }
   };
+}
+
+function pauseAllSwells() {
+  shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.pause(); });
+}
+function resumeAllSwells() {
+  shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.resume(); });
 }
 
 function attachSynth(shape) {
@@ -1063,6 +1087,8 @@ function onDown(e) {
 
   if (!hit) return;
 
+  pauseAllSwells();
+
   if (hit.from === 'palette') {
     const tmpl = hit.shape;
     const ns = makeShape(tmpl.type, tmpl.x, tmpl.y, false);
@@ -1132,6 +1158,7 @@ function onUp(e) {
   }
 
   drag = null;
+  resumeAllSwells();
 }
 
 cvs.addEventListener('pointerdown', onDown, { passive: false });
