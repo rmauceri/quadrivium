@@ -124,30 +124,27 @@ function initAudio() {
   if (rawCtx.state === 'suspended') rawCtx.resume();
   Tone.setContext(rawCtx);
 
-  // Build audio graph immediately — raw context is already running
-  try { Tone.start(); } catch(_){}
-  Tone.Transport.start();
+  // Must await Tone.start before Transport works reliably
+  Tone.start().then(() => {
+    Tone.Transport.start();
 
-  masterGain = new Tone.Gain(volumeVal).toDestination();
-  masterComp = new Tone.Compressor({ threshold: -18, ratio: 2.5, attack: 0.05, release: 0.25 }).connect(masterGain);
+    masterGain = new Tone.Gain(volumeVal).toDestination();
+    masterComp = new Tone.Compressor({ threshold: -18, ratio: 2.5, attack: 0.05, release: 0.25 }).connect(masterGain);
 
-  // Reverb setup — non-blocking
-  masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
-  masterVerb.ready.then(() => {
-    try {
-      masterVerb.connect(Tone.Destination);
-      masterGain.disconnect();
-      masterGain.connect(masterVerb);
-    } catch(_){}
-  }).catch(() => {});
+    // Reverb setup — non-blocking, but don't disconnect masterGain
+    masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
+    masterVerb.ready.then(() => {
+      try { masterComp.connect(masterVerb); } catch(_){}
+    }).catch(() => {});
 
-  // Attach synths to any shapes already on the table
-  shapes.forEach(s => attachSynth(s));
-  recomputeProximity();
+    // Attach synths to any shapes already on the table
+    shapes.forEach(s => attachSynth(s));
+    recomputeProximity();
+  }).catch(() => { audioOK = false; });
 }
 
 function attachSynth(shape) {
-  if (shape.synth || shape.isPalette || !audioOK) return;
+  if (shape.synth || shape.isPalette || !masterComp) return;
   let synth, extras = [];
 
   switch (shape.type) {
@@ -181,7 +178,7 @@ function attachSynth(shape) {
         volume: -6
       });
       const filt = new Tone.Filter({ frequency: 5000, type: 'bandpass', Q: 2 });
-      tick.chain(filt, masterGain);
+      tick.chain(filt, masterComp);
       extras.push(filt);
       const rate = 0.2 + shape.x * 0.8;
       const loop = new Tone.Loop((time) => {
@@ -211,7 +208,7 @@ function attachSynth(shape) {
         envelope: { attack: 0.001, decay: 0.3, sustain: 0, release: 0.4 },
         volume: 0
       });
-      kick.connect(masterGain);
+      kick.connect(masterComp);
       extras = [];
       const rate = 0.4 + shape.x * 1.6;
       const loop = new Tone.Loop((time) => {
@@ -667,7 +664,7 @@ function onDown(e) {
     const tmpl = hit.shape;
     const ns = makeShape(tmpl.type, tmpl.x, tmpl.y, false);
     shapes.push(ns);
-    if (audioOK) attachSynth(ns);
+    if (masterComp) attachSynth(ns);
     drag = { shape: ns, ox: 0, oy: 0, fromPal: true };
   } else {
     drag = {
