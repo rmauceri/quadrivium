@@ -80,6 +80,7 @@ let shapes   = [];
 let palette  = [];
 let drag     = null;
 let audioOK  = false;
+let audioInit = false;
 let tapTime  = 0, tapId = -1;
 let proxPairs = [];
 let nextId   = 1;
@@ -114,32 +115,32 @@ function pxDist(a, b) {
    AUDIO ENGINE
    ============================================================= */
 
-async function startAudio() {
-  if (audioOK) return;
-  audioOK = true;
-  document.getElementById('overlay').classList.add('hidden');
+function unlockAudio() {
+  if (audioInit) return;
+  audioInit = true;
 
-  // iOS-safe: create raw AudioContext synchronously in the gesture handler
-  // then hand it to Tone.js — this is the proven wunderkammer pattern
+  // Synchronous AudioContext creation — proven iOS pattern from wunderkammer
   const rawCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (rawCtx.state === 'suspended') rawCtx.resume();
   Tone.setContext(rawCtx);
 
-  await Tone.start();
-  Tone.Transport.start();
+  // Fire-and-forget the async setup
+  Tone.start().then(() => {
+    Tone.Transport.start();
 
-  // Build audio graph — do NOT await reverb before first sound
-  masterGain = new Tone.Gain(volumeVal).toDestination();
-  masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterGain);
+    masterGain = new Tone.Gain(volumeVal).toDestination();
+    masterComp = new Tone.Compressor({ threshold: -22, ratio: 3, attack: 0.05, release: 0.25 }).connect(masterGain);
 
-  // Reverb connects async — first notes play dry, reverb fades in when ready
-  masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
-  masterVerb.ready.then(() => {
-    try { masterVerb.connect(Tone.Destination); masterGain.disconnect(); masterGain.connect(masterVerb); } catch(_){}
-  }).catch(() => {});
+    // Reverb connects async — first notes play dry, reverb fades in when ready
+    masterVerb = new Tone.Reverb({ decay: 2.8, wet: 0.32 });
+    masterVerb.ready.then(() => {
+      try { masterVerb.connect(Tone.Destination); masterGain.disconnect(); masterGain.connect(masterVerb); } catch(_){}
+    }).catch(() => {});
 
-  shapes.forEach(s => attachSynth(s));
-  recomputeProximity();
+    shapes.forEach(s => attachSynth(s));
+    recomputeProximity();
+    audioOK = true;
+  }).catch(() => { audioInit = false; });
 }
 
 function attachSynth(shape) {
@@ -646,13 +647,15 @@ function hitTest(px, py) {
 }
 
 function onDown(e) {
-  // Audio unlock MUST be synchronous on iOS — no awaits before it
-  if (!audioOK) {
-    startAudio();
-  }
-
   e.preventDefault();
   if (e.pointerId != null) cvs.setPointerCapture(e.pointerId);
+
+  // First tap: unlock audio and dismiss overlay
+  if (!audioInit) {
+    unlockAudio();
+    document.getElementById('overlay').classList.add('hidden');
+    return;
+  }
 
   if (!audioOK) return;
 
@@ -742,7 +745,11 @@ cvs.addEventListener('pointercancel', () => { drag = null; });
 
 // iOS Safari fallback — touchstart is more reliable for audio unlock
 cvs.addEventListener('touchstart', (e) => {
-  if (!audioOK) { startAudio(); e.preventDefault(); }
+  if (!audioInit) {
+    unlockAudio();
+    document.getElementById('overlay').classList.add('hidden');
+    e.preventDefault();
+  }
 }, { passive: false });
 
 /* =============================================================
