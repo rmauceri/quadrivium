@@ -69,6 +69,7 @@ let proxPairs = [];
 let nextId   = 1;
 let volumeVal = 0.3;
 let volDrag   = false;
+let motes    = [];   // floating dust particles
 
 let grainCvs, tableCvs;
 let masterGain;
@@ -466,7 +467,9 @@ function recomputeProximity() {
   shapes.forEach(s => s.proxBoost = 0);
 
   for (let i = 0; i < shapes.length; i++) {
+    if (shapes[i].dying) continue;
     for (let j = i + 1; j < shapes.length; j++) {
+      if (shapes[j].dying) continue;
       const d = pxDist(shapes[i], shapes[j]);
       if (d < thresh) {
         const str = 1 - d / thresh;
@@ -498,6 +501,77 @@ function drawProximityLines() {
 }
 
 /* =============================================================
+   DUST MOTES — luminous particles drifting across the table
+   ============================================================= */
+
+const MOTE_COUNT = 60;
+const MOTE_DRIFT = 0.00004;  // base drift speed (fraction of screen per frame)
+const MOTE_PULL  = 0.00015;  // attraction toward sounding shapes
+
+function initMotes() {
+  motes = [];
+  for (let i = 0; i < MOTE_COUNT; i++) {
+    motes.push({
+      x: Math.random(),
+      y: Math.random() * PAL_ZONE,
+      vx: (Math.random() - 0.5) * MOTE_DRIFT,
+      vy: (Math.random() - 0.5) * MOTE_DRIFT,
+      r: 0.8 + Math.random() * 1.2,
+      alpha: 0.06 + Math.random() * 0.12,
+      phase: Math.random() * Math.PI * 2,
+    });
+  }
+}
+
+function updateAndDrawMotes(time) {
+  const t = time * 0.001;
+  ctx.save();
+  motes.forEach(m => {
+    // Gentle attraction toward sounding shapes
+    let ax = 0, ay = 0;
+    shapes.forEach(s => {
+      if (s.dying) return;
+      const dx = s.x - m.x, dy = s.y - m.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) + 0.01;
+      if (dist < 0.3) {
+        const pull = MOTE_PULL * (1 - dist / 0.3);
+        ax += (dx / dist) * pull;
+        ay += (dy / dist) * pull;
+      }
+    });
+
+    m.vx += ax;
+    m.vy += ay;
+    // Damping
+    m.vx *= 0.992;
+    m.vy *= 0.992;
+    // Drift noise
+    m.vx += (Math.random() - 0.5) * MOTE_DRIFT * 0.3;
+    m.vy += (Math.random() - 0.5) * MOTE_DRIFT * 0.3;
+
+    m.x += m.vx;
+    m.y += m.vy;
+
+    // Wrap around
+    if (m.x < -0.02) m.x = 1.02;
+    if (m.x > 1.02) m.x = -0.02;
+    if (m.y < -0.02) m.y = PAL_ZONE + 0.02;
+    if (m.y > PAL_ZONE + 0.02) m.y = -0.02;
+
+    // Slow twinkle
+    const flicker = 0.7 + 0.3 * Math.sin(t * 0.8 + m.phase);
+    const a = m.alpha * flicker;
+
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(220,210,190,1)';
+    ctx.beginPath();
+    ctx.arc(m.x * W, m.y * H, m.r, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+}
+
+/* =============================================================
    SHAPE SYSTEM
    ============================================================= */
 
@@ -517,7 +591,9 @@ function makeShape(type, x, y, asPalette) {
     seed: Math.floor(Math.random() * 1e6),
     volAngle: 0,       // rotation offset from volume knob (radians, 0 = default vol)
     synth: null, extras: [],
-    opacity: asPalette ? 0.55 : 1,
+    opacity: asPalette ? 0.55 : 0,    // non-palette shapes fade in from 0
+    fadeTarget: asPalette ? 0.55 : 1,
+    dying: false,
     isPalette: !!asPalette,
     proxBoost: 0,
     _cache: null, _dirty: true,
@@ -676,8 +752,9 @@ function drawShape(shape, time) {
 }
 
 function removeShape(shape) {
-  const idx = shapes.indexOf(shape);
-  if (idx >= 0) shapes.splice(idx, 1);
+  if (shape.dying) return;
+  shape.dying = true;
+  // Fade audio out in parallel
   detachSynth(shape);
   recomputeProximity();
 }
@@ -809,6 +886,7 @@ function hitTest(px, py) {
   const EDGE_INNER = 0.55;  // fraction of hit radius — inside this is 'center'
   for (let i = shapes.length - 1; i >= 0; i--) {
     const s = shapes[i];
+    if (s.dying) continue;
     const dx = px - s.x * W, dy = py - s.y * H;
     const dist = Math.sqrt(dx * dx + dy * dy);
     const hr = Math.max(s.size * unit * 0.55, MIN_HIT);
@@ -975,7 +1053,22 @@ function draw(time) {
 
   // Late-attach synths — only when context is running
   if (masterGain && actx && actx.state === 'running') {
-    shapes.forEach(s => { if (!s.synth && !s.isPalette) attachSynth(s); });
+    shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying) attachSynth(s); });
+  }
+
+  // Fade transitions
+  shapes.forEach(s => {
+    if (s.dying) {
+      s.opacity = Math.max(0, s.opacity - 0.025);
+    } else if (s.opacity < s.fadeTarget) {
+      s.opacity = Math.min(s.fadeTarget, s.opacity + 0.02);
+    }
+  });
+  // Remove fully faded shapes
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    if (shapes[i].dying && shapes[i].opacity <= 0) {
+      shapes.splice(i, 1);
+    }
   }
 
   // Background
@@ -984,6 +1077,9 @@ function draw(time) {
 
   // Static table surface
   if (tableCvs) ctx.drawImage(tableCvs, 0, 0);
+
+  // Dust motes (behind shapes)
+  updateAndDrawMotes(time);
 
   // Proximity lines
   drawProximityLines();
@@ -1049,6 +1145,7 @@ window.addEventListener('resize', resize);
 resize();
 initPalette();
 initScene();
+initMotes();
 requestAnimationFrame(draw);
 </script>
 </body>
