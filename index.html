@@ -861,6 +861,13 @@ function drawShape(shape, time) {
   // Lift when dragging
   if (drag && drag.shape === shape) sc *= 1.1;
 
+  // Scale by volume knob: mute (0x) → 0.5 size, default (1x) → 1.0, max (2x) → 1.5
+  if (!shape.isPalette) {
+    const VOL_TURNS = 3;
+    const knob = clamp(1 + (shape.volAngle || 0) / (VOL_TURNS * Math.PI), 0, 2);
+    sc *= 0.5 + knob * 0.5;
+  }
+
   // Glow when proximate
   const glow = Math.min((shape.proxBoost || 0) / 4, 0.5);
 
