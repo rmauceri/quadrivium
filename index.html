@@ -187,6 +187,8 @@ function startSwellCycle(gainNode, baseVol) {
   let stopped = false;
   let paused = false;
   let timeout;
+  // Timing state for visual readback
+  let cStart = 0, cRise = 0, cHold = 0, cFall = 0, cPeak = 1, cFloor = 0.03;
 
   function cycle() {
     if (stopped || paused) return;
@@ -197,6 +199,9 @@ function startSwellCycle(gainNode, baseVol) {
     const rest = 2 + Math.random() * 5;
     const peak = baseVol * (0.7 + Math.random() * 0.3);
     const floor = baseVol * 0.03;
+
+    cStart = now; cRise = rise; cHold = hold; cFall = fall;
+    cPeak = peak / baseVol; cFloor = floor / baseVol;
 
     gainNode.gain.cancelScheduledValues(now);
     gainNode.gain.setValueAtTime(gainNode.gain.value, now);
@@ -209,6 +214,16 @@ function startSwellCycle(gainNode, baseVol) {
 
   cycle();
   return {
+    // Returns 0..1 representing current swell envelope for visual scaling
+    getValue() {
+      if (paused || stopped || !actx) return 1;
+      const t = actx.currentTime - cStart;
+      if (t < 0) return cFloor;
+      if (t < cRise) return cFloor + (cPeak - cFloor) * (t / cRise);
+      if (t < cRise + cHold) return cPeak;
+      if (t < cRise + cHold + cFall) return cPeak - (cPeak - cFloor) * ((t - cRise - cHold) / cFall);
+      return cFloor;
+    },
     pause() {
       if (paused) return;
       paused = true;
@@ -866,6 +881,11 @@ function drawShape(shape, time) {
     const VOL_TURNS = 3;
     const knob = clamp(1 + (shape.volAngle || 0) / (VOL_TURNS * Math.PI), 0, 2);
     sc *= 0.5 + knob * 0.5;
+    // Swell breathing: shapes physically grow/shrink with the swell envelope
+    if (shape.synth && shape.synth.swell) {
+      const sv = shape.synth.swell.getValue();  // 0..1
+      sc *= 0.6 + sv * 0.4;  // range: 60%–100% of current size
+    }
   }
 
   // Glow when proximate
