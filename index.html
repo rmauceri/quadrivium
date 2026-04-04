@@ -70,6 +70,9 @@ let nextId   = 1;
 let volumeVal = 0.3;
 let volDrag   = false;
 let motes    = [];   // floating dust particles
+let soundPalette = Math.floor(Math.random() * 3); // randomize on each load
+
+const PALETTE_NAMES = ['Ether', 'Crystal', 'Void'];
 
 let grainCvs, tableCvs;
 let masterGain;
@@ -182,61 +185,65 @@ function initAudio() {
 // --- Synth builders per shape type ---
 
 // Slow swell cycling: shapes breathe in and out over long periods
-// instead of droning continuously. Returns controller with pause/resume/stop.
+// instead of droning continuously. Purely JS-driven — no AudioParam
+// automation on the envelope, so there are zero timeline conflicts
+// with setVol or pause/resume. Call tick() each frame to apply.
 function startSwellCycle(gainNode, baseVol) {
   let stopped = false;
   let paused = false;
   let timeout;
-  // Timing state for visual readback
+  let pausedTime = 0;
   let cStart = 0, cRise = 0, cHold = 0, cFall = 0, cPeak = 1, cFloor = 0.03;
 
   function cycle() {
     if (stopped || paused) return;
-    const now = actx.currentTime;
-    const rise = 3 + Math.random() * 4;
-    const hold = 2 + Math.random() * 3;
-    const fall = 3 + Math.random() * 4;
+    cStart = actx.currentTime;
+    cRise = 3 + Math.random() * 4;
+    cHold = 2 + Math.random() * 3;
+    cFall = 3 + Math.random() * 4;
     const rest = 2 + Math.random() * 5;
-    const peak = baseVol * (0.7 + Math.random() * 0.3);
-    const floor = baseVol * 0.03;
+    cPeak = 0.7 + Math.random() * 0.3;
+    cFloor = 0.03;
+    timeout = setTimeout(cycle, (cRise + cHold + cFall + rest) * 1000);
+  }
 
-    cStart = now; cRise = rise; cHold = hold; cFall = fall;
-    cPeak = peak / baseVol; cFloor = floor / baseVol;
-
-    gainNode.gain.cancelScheduledValues(now);
-    gainNode.gain.setValueAtTime(gainNode.gain.value, now);
-    gainNode.gain.linearRampToValueAtTime(peak, now + rise);
-    gainNode.gain.setValueAtTime(peak, now + rise + hold);
-    gainNode.gain.linearRampToValueAtTime(floor, now + rise + hold + fall);
-
-    timeout = setTimeout(cycle, (rise + hold + fall + rest) * 1000);
+  function computeValue() {
+    if (stopped || !actx) return 1;
+    const t = paused ? pausedTime : (actx.currentTime - cStart);
+    if (t < 0) return cFloor;
+    if (t < cRise) return cFloor + (cPeak - cFloor) * (t / cRise);
+    if (t < cRise + cHold) return cPeak;
+    if (t < cRise + cHold + cFall)
+      return cPeak - (cPeak - cFloor) * ((t - cRise - cHold) / cFall);
+    return cFloor;
   }
 
   cycle();
   return {
-    // Returns 0..1 representing current swell envelope for visual scaling
-    getValue() {
-      if (paused || stopped || !actx) return 1;
-      const t = actx.currentTime - cStart;
-      if (t < 0) return cFloor;
-      if (t < cRise) return cFloor + (cPeak - cFloor) * (t / cRise);
-      if (t < cRise + cHold) return cPeak;
-      if (t < cRise + cHold + cFall) return cPeak - (cPeak - cFloor) * ((t - cRise - cHold) / cFall);
-      return cFloor;
+    getValue() { return computeValue(); },
+    // Called every frame from the render loop — sets envelope gain directly
+    tick() {
+      if (stopped) return;
+      gainNode.gain.value = computeValue() * baseVol;
     },
     pause() {
       if (paused) return;
+      pausedTime = actx.currentTime - cStart;
       paused = true;
       clearTimeout(timeout);
-      const now = actx.currentTime;
-      gainNode.gain.cancelScheduledValues(now);
-      gainNode.gain.setValueAtTime(gainNode.gain.value, now);
-      gainNode.gain.linearRampToValueAtTime(baseVol, now + 0.5);
+      // No AudioParam manipulation needed — tick() will just keep
+      // writing the frozen pausedTime value each frame
     },
     resume() {
       if (!paused) return;
+      // Adjust cStart so the cycle continues seamlessly from where it froze
+      cStart = actx.currentTime - pausedTime;
       paused = false;
-      timeout = setTimeout(cycle, 2000 + Math.random() * 3000);
+      const elapsed = pausedTime;
+      const cycleDur = cRise + cHold + cFall;
+      const rest = 2 + Math.random() * 5;
+      const remaining = (cycleDur + rest) - elapsed;
+      timeout = setTimeout(cycle, Math.max(500, remaining * 1000));
     },
     stop() { stopped = true; clearTimeout(timeout); }
   };
@@ -287,7 +294,7 @@ function buildCircleSynth(freq) {
       osc.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
       driftGain.gain.value = f * 0.006;
     },
-    setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
     destroy() {
       swell.stop();
       gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
@@ -373,7 +380,7 @@ function buildTriangleSynth(freq) {
       driftGain.gain.value = f * 0.005;
       fmLfoGain.gain.value = f * 0.4;
     },
-    setVol(v) { out.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    setVol(v) { out.gain.cancelScheduledValues(0); out.gain.value = v; },
     destroy() {
       swell.stop();
       out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
@@ -416,7 +423,7 @@ function buildSquareSynth(shape) {
       intervalId = setInterval(tick, r * 1000);
       this.intervalId = intervalId;
     },
-    setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
     destroy() {
       clearInterval(intervalId);
       gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
@@ -491,7 +498,7 @@ function buildPentagonSynth(freq) {
     setFreq(f) {
       oscs.forEach(o => o.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12));
     },
-    setVol(v) { mix.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    setVol(v) { mix.gain.cancelScheduledValues(0); mix.gain.value = v; },
     destroy() {
       swell.stop();
       mix.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
@@ -557,7 +564,589 @@ function buildHexagonSynth(shape) {
       this.intervalId = intervalId;
     },
     setPitch(p) { basePitch = p; },
-    setVol(v) { gain.gain.linearRampToValueAtTime(v, actx.currentTime + 0.25); },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
+    destroy() {
+      clearInterval(intervalId);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
+      setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
+    }
+  };
+}
+
+/* =============================================================
+   CRYSTAL PALETTE — gamelan / bell-like / metallic resonance
+   ============================================================= */
+
+function buildCrystalCircleSynth(freq) {
+  // Singing bowl: inharmonic partials with slow shimmer
+  const gain = actx.createGain();
+  gain.gain.value = 0.25;
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+
+  // Inharmonic partials (singing bowl ratios)
+  const ratios = [1, 2.71, 5.04, 7.76];
+  const amps   = [0.5, 0.35, 0.2, 0.1];
+  const oscs = ratios.map((r, i) => {
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq * r;
+    const g = actx.createGain();
+    g.gain.value = amps[i];
+    osc.connect(g);
+    g.connect(envelope);
+    osc.start();
+    return osc;
+  });
+
+  // Slow shimmer on partials
+  const shimLfo = actx.createOscillator();
+  shimLfo.type = 'sine';
+  shimLfo.frequency.value = 0.08 + Math.random() * 0.04;
+  const shimGain = actx.createGain();
+  shimGain.gain.value = freq * 0.003;
+  shimLfo.connect(shimGain);
+  shimGain.connect(oscs[1].frequency);
+  shimLfo.start();
+
+  envelope.connect(gain);
+  gain.connect(masterGain);
+
+  const swell = startSwellCycle(envelope, 1.0);
+
+  return { oscs, gain, envelope, shimLfo, swell,
+    setFreq(f) {
+      oscs.forEach((o, i) => o.frequency.linearRampToValueAtTime(f * ratios[i], actx.currentTime + 0.12));
+      shimGain.gain.value = f * 0.003;
+    },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
+    destroy() {
+      swell.stop();
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { oscs.forEach(o => o.stop()); shimLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildCrystalTriangleSynth(freq) {
+  // Glass bell: ring modulation — two sines multiplied
+  const carrier = actx.createOscillator();
+  carrier.type = 'sine';
+  carrier.frequency.value = freq;
+
+  const modulator = actx.createOscillator();
+  modulator.type = 'sine';
+  modulator.frequency.value = freq * 1.414;  // irrational ratio = inharmonic
+
+  // Ring mod via gain node
+  const ringGain = actx.createGain();
+  ringGain.gain.value = 0;
+  modulator.connect(ringGain.gain);
+  carrier.connect(ringGain);
+
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+  const out = actx.createGain();
+  out.gain.value = 0.25;
+  ringGain.connect(envelope);
+  envelope.connect(out);
+  out.connect(masterGain);
+
+  // Slow drift
+  const driftLfo = actx.createOscillator();
+  driftLfo.type = 'sine';
+  driftLfo.frequency.value = 0.06 + Math.random() * 0.04;
+  const driftG = actx.createGain();
+  driftG.gain.value = freq * 0.004;
+  driftLfo.connect(driftG);
+  driftG.connect(modulator.frequency);
+  driftLfo.start();
+
+  carrier.start();
+  modulator.start();
+
+  const swell = startSwellCycle(envelope, 1.0);
+
+  return { carrier, modulator, out, envelope, driftLfo, swell,
+    setFreq(f) {
+      carrier.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
+      modulator.frequency.linearRampToValueAtTime(f * 1.414, actx.currentTime + 0.12);
+      driftG.gain.value = f * 0.004;
+    },
+    setVol(v) { out.gain.cancelScheduledValues(0); out.gain.value = v; },
+    destroy() {
+      swell.stop();
+      out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { carrier.stop(); modulator.stop(); driftLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildCrystalSquareSynth(shape) {
+  // Wind chimes: randomized high metallic pings
+  const gain = actx.createGain();
+  gain.gain.value = 0.2;
+  gain.connect(masterGain);
+
+  const baseFreq = 800 + shape.y * 1200;
+  const rate = 0.3 + shape.x * 1.5;
+
+  function chime() {
+    const f = baseFreq * (0.8 + Math.random() * 0.4);
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    const now = actx.currentTime;
+    osc.frequency.setValueAtTime(f, now);
+    // Second partial
+    const osc2 = actx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(f * 2.76, now);
+    const env = actx.createGain();
+    env.gain.setValueAtTime(0.6, now);
+    env.gain.exponentialRampToValueAtTime(0.001, now + 0.8);
+    const env2 = actx.createGain();
+    env2.gain.setValueAtTime(0.2, now);
+    env2.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+    osc.connect(env);
+    osc2.connect(env2);
+    env.connect(gain);
+    env2.connect(gain);
+    osc.start(now);
+    osc2.start(now);
+    osc.stop(now + 1);
+    osc2.stop(now + 0.6);
+  }
+  let intervalId = setInterval(chime, rate * 1000);
+  chime();
+
+  return { _isRhythm: true, gain, intervalId,
+    setRate(r) {
+      clearInterval(intervalId);
+      this.rate = r;
+      intervalId = setInterval(chime, r * 1000);
+      this.intervalId = intervalId;
+    },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
+    destroy() {
+      clearInterval(intervalId);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
+      setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
+    }
+  };
+}
+
+function buildCrystalPentagonSynth(freq) {
+  // Plucked string via Karplus-Strong
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+  const out = actx.createGain();
+  out.gain.value = 0.3;
+
+  let curFreq = freq;
+  let pluckInterval;
+
+  function pluck() {
+    const bufLen = Math.round(actx.sampleRate / curFreq);
+    const ksBuffer = actx.createBuffer(1, bufLen, actx.sampleRate);
+    const data = ksBuffer.getChannelData(0);
+    for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+    const src = actx.createBufferSource();
+    src.buffer = ksBuffer;
+    src.loop = true;
+
+    const lp = actx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = curFreq * 3;
+    lp.Q.value = 0.5;
+
+    const pluckEnv = actx.createGain();
+    const now = actx.currentTime;
+    pluckEnv.gain.setValueAtTime(0.7, now);
+    pluckEnv.gain.exponentialRampToValueAtTime(0.001, now + 2.5);
+
+    src.connect(lp);
+    lp.connect(pluckEnv);
+    pluckEnv.connect(envelope);
+    src.start(now);
+    src.stop(now + 3);
+  }
+
+  pluck();
+  pluckInterval = setInterval(pluck, 3000 + Math.random() * 4000);
+
+  envelope.connect(out);
+  out.connect(masterGain);
+
+  const swell = startSwellCycle(envelope, 1.0);
+
+  return { out, envelope, swell,
+    setFreq(f) {
+      curFreq = f;
+      pluck();  // immediate re-pluck at new pitch
+    },
+    setVol(v) { out.gain.cancelScheduledValues(0); out.gain.value = v; },
+    destroy() {
+      swell.stop();
+      clearInterval(pluckInterval);
+      out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { try { out.disconnect(); } catch(_){} }, 700);
+    }
+  };
+}
+
+function buildCrystalHexagonSynth(shape) {
+  // Gong: low inharmonic hit with long sustain
+  const gain = actx.createGain();
+  gain.gain.value = 0.45;
+  gain.connect(masterGain);
+
+  let basePitch = pitchFromY(shape.y) * 0.3;
+
+  function gong() {
+    const now = actx.currentTime;
+    const p = basePitch * (0.95 + Math.random() * 0.1);
+
+    // Fundamental with slow decay
+    const osc1 = actx.createOscillator();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(p, now);
+    const env1 = actx.createGain();
+    env1.gain.setValueAtTime(0.8, now);
+    env1.gain.exponentialRampToValueAtTime(0.001, now + 2.5);
+    osc1.connect(env1);
+    env1.connect(gain);
+    osc1.start(now);
+    osc1.stop(now + 3);
+
+    // Inharmonic partial
+    const osc2 = actx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(p * 2.41, now);
+    const env2 = actx.createGain();
+    env2.gain.setValueAtTime(0.4, now);
+    env2.gain.exponentialRampToValueAtTime(0.001, now + 1.8);
+    osc2.connect(env2);
+    env2.connect(gain);
+    osc2.start(now);
+    osc2.stop(now + 2);
+
+    // Noise splash
+    const nSrc = actx.createBufferSource();
+    nSrc.buffer = getNoiseBuffer();
+    const nFilt = actx.createBiquadFilter();
+    nFilt.type = 'bandpass';
+    nFilt.frequency.value = p * 4;
+    nFilt.Q.value = 1.5;
+    const nEnv = actx.createGain();
+    nEnv.gain.setValueAtTime(0.25, now);
+    nEnv.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+    nSrc.connect(nFilt);
+    nFilt.connect(nEnv);
+    nEnv.connect(gain);
+    nSrc.start(now);
+    nSrc.stop(now + 0.2);
+  }
+
+  let intervalId = setInterval(gong, (0.8 + shape.x * 2.5) * 1000);
+  gong();
+
+  return { _isRhythm: true, gain, intervalId, basePitch,
+    setRate(r) {
+      clearInterval(intervalId);
+      this.rate = r;
+      intervalId = setInterval(gong, r * 1000);
+      this.intervalId = intervalId;
+    },
+    setPitch(p) { basePitch = p; },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
+    destroy() {
+      clearInterval(intervalId);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
+      setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
+    }
+  };
+}
+
+/* =============================================================
+   VOID PALETTE — cosmic / pulsar / radio astronomy
+   ============================================================= */
+
+function buildVoidCircleSynth(freq) {
+  // Pulsar drone: very low sine with slow amplitude modulation
+  const osc = actx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = freq * 0.5;
+
+  const gain = actx.createGain();
+  gain.gain.value = 0.3;
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+
+  // Sub-harmonic rumble
+  const sub = actx.createOscillator();
+  sub.type = 'sine';
+  sub.frequency.value = freq * 0.25;
+  const subGain = actx.createGain();
+  subGain.gain.value = 0.15;
+  sub.connect(subGain);
+  subGain.connect(envelope);
+  sub.start();
+
+  // Very slow AM — pulsar-like throb
+  const amLfo = actx.createOscillator();
+  amLfo.type = 'sine';
+  amLfo.frequency.value = 0.03 + Math.random() * 0.04;
+  const amGain = actx.createGain();
+  amGain.gain.value = 0.4;
+  amLfo.connect(amGain);
+  amGain.connect(envelope.gain);
+  amLfo.start();
+
+  // Pitch drift
+  const driftLfo = actx.createOscillator();
+  driftLfo.type = 'sine';
+  driftLfo.frequency.value = 0.02 + Math.random() * 0.02;
+  const driftG = actx.createGain();
+  driftG.gain.value = freq * 0.008;
+  driftLfo.connect(driftG);
+  driftG.connect(osc.frequency);
+  driftLfo.start();
+
+  osc.connect(envelope);
+  envelope.connect(gain);
+  gain.connect(masterGain);
+  osc.start();
+
+  const swell = startSwellCycle(envelope, 1.0);
+
+  return { osc, sub, gain, envelope, amLfo, driftLfo, swell,
+    setFreq(f) {
+      osc.frequency.linearRampToValueAtTime(f * 0.5, actx.currentTime + 0.12);
+      sub.frequency.linearRampToValueAtTime(f * 0.25, actx.currentTime + 0.12);
+      driftG.gain.value = f * 0.008;
+    },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
+    destroy() {
+      swell.stop();
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { osc.stop(); sub.stop(); amLfo.stop(); driftLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildVoidTriangleSynth(freq) {
+  // Radio static: filtered noise with resonant sweep
+  const noise = actx.createBufferSource();
+  noise.buffer = getNoiseBuffer();
+  noise.loop = true;
+
+  const bp = actx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = freq;
+  bp.Q.value = 8;
+
+  // Sweep the filter slowly
+  const sweepLfo = actx.createOscillator();
+  sweepLfo.type = 'sine';
+  sweepLfo.frequency.value = 0.05 + Math.random() * 0.04;
+  const sweepG = actx.createGain();
+  sweepG.gain.value = freq * 0.8;
+  sweepLfo.connect(sweepG);
+  sweepG.connect(bp.frequency);
+  sweepLfo.start();
+
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+  const out = actx.createGain();
+  out.gain.value = 0.18;
+  noise.connect(bp);
+  bp.connect(envelope);
+  envelope.connect(out);
+  out.connect(masterGain);
+  noise.start();
+
+  const swell = startSwellCycle(envelope, 1.0);
+
+  return { noise, bp, out, envelope, sweepLfo, swell,
+    setFreq(f) {
+      bp.frequency.linearRampToValueAtTime(f, actx.currentTime + 0.12);
+      sweepG.gain.value = f * 0.8;
+    },
+    setVol(v) { out.gain.cancelScheduledValues(0); out.gain.value = v; },
+    destroy() {
+      swell.stop();
+      out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { noise.stop(); sweepLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildVoidSquareSynth(shape) {
+  // Solar wind: irregular noise bursts, like Geiger counter static
+  const gain = actx.createGain();
+  gain.gain.value = 0.15;
+  gain.connect(masterGain);
+
+  function burst() {
+    const now = actx.currentTime;
+    const src = actx.createBufferSource();
+    src.buffer = getNoiseBuffer();
+    const hp = actx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 2000 + Math.random() * 4000;
+    hp.Q.value = 3;
+    const env = actx.createGain();
+    const dur = 0.01 + Math.random() * 0.04;
+    env.gain.setValueAtTime(0.3 + Math.random() * 0.5, now);
+    env.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    src.connect(hp);
+    hp.connect(env);
+    env.connect(gain);
+    src.start(now);
+    src.stop(now + dur + 0.01);
+
+    // Irregular timing
+    const next = 0.05 + Math.random() * (0.4 + shape.x * 0.8);
+    timeout = setTimeout(burst, next * 1000);
+  }
+
+  let timeout;
+  burst();
+
+  return { _isRhythm: true, gain,
+    setRate(r) { /* rate is self-modulating */ },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
+    destroy() {
+      clearTimeout(timeout);
+      gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
+      setTimeout(() => { try { gain.disconnect(); } catch(_){} }, 600);
+    }
+  };
+}
+
+function buildVoidPentagonSynth(freq) {
+  // Plasma oscillation: detuned saws through formant filters
+  const envelope = actx.createGain();
+  envelope.gain.value = 0.03;
+  const out = actx.createGain();
+  out.gain.value = 0.15;
+
+  // Two detuned sawtooths
+  const osc1 = actx.createOscillator();
+  osc1.type = 'sawtooth';
+  osc1.frequency.value = freq * 0.5;
+  const osc2 = actx.createOscillator();
+  osc2.type = 'sawtooth';
+  osc2.frequency.value = freq * 0.502;
+
+  // Formant filter pair
+  const f1 = actx.createBiquadFilter();
+  f1.type = 'bandpass';
+  f1.frequency.value = freq * 2;
+  f1.Q.value = 5;
+  const f2 = actx.createBiquadFilter();
+  f2.type = 'bandpass';
+  f2.frequency.value = freq * 3.5;
+  f2.Q.value = 5;
+
+  // Slow formant sweep
+  const fLfo = actx.createOscillator();
+  fLfo.type = 'sine';
+  fLfo.frequency.value = 0.035 + Math.random() * 0.03;
+  const fG = actx.createGain();
+  fG.gain.value = freq * 1.5;
+  fLfo.connect(fG);
+  fG.connect(f1.frequency);
+  fLfo.start();
+
+  const mix = actx.createGain();
+  mix.gain.value = 0.5;
+  osc1.connect(f1);
+  osc2.connect(f1);
+  osc1.connect(f2);
+  osc2.connect(f2);
+  f1.connect(mix);
+  f2.connect(mix);
+  mix.connect(envelope);
+  envelope.connect(out);
+  out.connect(masterGain);
+  osc1.start();
+  osc2.start();
+
+  const swell = startSwellCycle(envelope, 1.0);
+
+  return { osc1, osc2, out, envelope, fLfo, swell,
+    setFreq(f) {
+      osc1.frequency.linearRampToValueAtTime(f * 0.5, actx.currentTime + 0.12);
+      osc2.frequency.linearRampToValueAtTime(f * 0.502, actx.currentTime + 0.12);
+      f1.frequency.linearRampToValueAtTime(f * 2, actx.currentTime + 0.12);
+      f2.frequency.linearRampToValueAtTime(f * 3.5, actx.currentTime + 0.12);
+      fG.gain.value = f * 1.5;
+    },
+    setVol(v) { out.gain.cancelScheduledValues(0); out.gain.value = v; },
+    destroy() {
+      swell.stop();
+      out.gain.linearRampToValueAtTime(0, actx.currentTime + 0.6);
+      setTimeout(() => { osc1.stop(); osc2.stop(); fLfo.stop(); }, 700);
+    }
+  };
+}
+
+function buildVoidHexagonSynth(shape) {
+  // Magnetosphere rumble: deep filtered noise hit with resonant tail
+  const gain = actx.createGain();
+  gain.gain.value = 0.5;
+  gain.connect(masterGain);
+
+  let basePitch = pitchFromY(shape.y) * 0.15;
+
+  function rumble() {
+    const now = actx.currentTime;
+    const p = basePitch * (0.9 + Math.random() * 0.2);
+
+    // Deep sine thud
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(p * 2, now);
+    osc.frequency.exponentialRampToValueAtTime(p, now + 0.3);
+    const oscEnv = actx.createGain();
+    oscEnv.gain.setValueAtTime(0.7, now);
+    oscEnv.gain.exponentialRampToValueAtTime(0.001, now + 1.5);
+    osc.connect(oscEnv);
+    oscEnv.connect(gain);
+    osc.start(now);
+    osc.stop(now + 2);
+
+    // Filtered noise rumble tail
+    const nSrc = actx.createBufferSource();
+    nSrc.buffer = getNoiseBuffer();
+    const lp = actx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(p * 6, now);
+    lp.frequency.exponentialRampToValueAtTime(p, now + 0.8);
+    lp.Q.value = 2;
+    const nEnv = actx.createGain();
+    nEnv.gain.setValueAtTime(0.4, now);
+    nEnv.gain.exponentialRampToValueAtTime(0.001, now + 1.0);
+    nSrc.connect(lp);
+    lp.connect(nEnv);
+    nEnv.connect(gain);
+    nSrc.start(now);
+    nSrc.stop(now + 1.2);
+  }
+
+  let intervalId = setInterval(rumble, (0.6 + shape.x * 2.0) * 1000);
+  rumble();
+
+  return { _isRhythm: true, gain, intervalId, basePitch,
+    setRate(r) {
+      clearInterval(intervalId);
+      this.rate = r;
+      intervalId = setInterval(rumble, r * 1000);
+      this.intervalId = intervalId;
+    },
+    setPitch(p) { basePitch = p; },
+    setVol(v) { gain.gain.cancelScheduledValues(0); gain.gain.value = v; },
     destroy() {
       clearInterval(intervalId);
       gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.5);
@@ -578,13 +1167,21 @@ function attachSynth(shape) {
   const freq = pitchFromY(shape.y);
   let synth;
 
-  switch (shape.type) {
-    case 'circle':   synth = buildCircleSynth(freq); break;
-    case 'triangle': synth = buildTriangleSynth(freq); break;
-    case 'square':   synth = buildSquareSynth(shape); break;
-    case 'pentagon': synth = buildPentagonSynth(freq); break;
-    case 'hexagon':  synth = buildHexagonSynth(shape); break;
-  }
+  const builders = [
+    // Ether (0)
+    { circle: buildCircleSynth, triangle: buildTriangleSynth,
+      square: buildSquareSynth, pentagon: buildPentagonSynth, hexagon: buildHexagonSynth },
+    // Crystal (1)
+    { circle: buildCrystalCircleSynth, triangle: buildCrystalTriangleSynth,
+      square: buildCrystalSquareSynth, pentagon: buildCrystalPentagonSynth, hexagon: buildCrystalHexagonSynth },
+    // Void (2)
+    { circle: buildVoidCircleSynth, triangle: buildVoidTriangleSynth,
+      square: buildVoidSquareSynth, pentagon: buildVoidPentagonSynth, hexagon: buildVoidHexagonSynth },
+  ];
+
+  const build = builders[soundPalette][shape.type];
+  const isRhythmType = (shape.type === 'square' || shape.type === 'hexagon');
+  synth = build(isRhythmType ? shape : freq);
 
   shape.synth = synth;
   synth.setVol(shapeVolume(shape));
@@ -609,6 +1206,18 @@ function updateShapeAudio(shape) {
   } else {
     shape.synth.setFreq(pitchFromY(shape.y));
   }
+}
+
+function switchSoundPalette() {
+  soundPalette = (soundPalette + 1) % PALETTE_NAMES.length;
+  // Tear down all synths and rebuild with new palette
+  shapes.forEach(s => detachSynth(s));
+  if (masterGain && actx && actx.state === 'running') {
+    shapes.forEach(s => { if (!s.isPalette && !s.dying) attachSynth(s); });
+  }
+  recomputeProximity();
+  // Rebuild table surface to update compass label
+  buildTable();
 }
 
 function applyProximityAudio() {
@@ -981,19 +1590,25 @@ function buildTable() {
     stroke: 'rgba(180,170,155,0.14)', strokeWidth: 0.8, roughness: 2, seed: 9999
   });
 
-  // Compass rose — upper-left
+  // Compass rose — upper-left (also serves as palette switch tap target)
+  // Visual style changes per palette — no text label
   const cx = unit * 0.06, cy = unit * 0.06, sz = unit * 0.032;
-  const cc = 'rgba(180,170,155,0.07)';
-  const lo = { stroke: cc, strokeWidth: 0.6, roughness: 1.5, seed: 7777 };
+  const compassStyles = [
+    // Ether — warm amber, soft
+    { stroke: 'rgba(210,180,120,0.12)', fill: 'rgba(210,180,120,0.10)', width: 0.6, rough: 1.8 },
+    // Crystal — cool ice-blue, crisp
+    { stroke: 'rgba(140,190,220,0.16)', fill: 'rgba(140,190,220,0.14)', width: 0.5, rough: 0.8 },
+    // Void — deep violet, dim
+    { stroke: 'rgba(160,120,200,0.13)', fill: 'rgba(160,120,200,0.11)', width: 0.7, rough: 2.2 },
+  ];
+  const cs = compassStyles[soundPalette];
+  const lo = { stroke: cs.stroke, strokeWidth: cs.width, roughness: cs.rough, seed: 7777 };
   trc.line(cx, cy - sz, cx, cy + sz, lo);
   trc.line(cx - sz, cy, cx + sz, cy, lo);
   const d2 = sz * 0.55;
   trc.line(cx - d2, cy - d2, cx + d2, cy + d2, lo);
   trc.line(cx + d2, cy - d2, cx - d2, cy + d2, lo);
-  trc.circle(cx, cy, sz * 0.2, { ...lo, fill: cc, fillStyle: 'solid' });
-  tc.font = `${Math.max(8, sz * 0.35)}px Georgia`;
-  tc.fillStyle = cc; tc.textAlign = 'center';
-  tc.fillText('N', cx, cy - sz - 3);
+  trc.circle(cx, cy, sz * 0.2, { ...lo, fill: cs.fill, fillStyle: 'solid' });
 
   // Smudge marks
   [[0.72, 0.30, 0.07], [0.18, 0.58, 0.045], [0.85, 0.70, 0.035]].forEach(([sx, sy, sr]) => {
@@ -1098,6 +1713,15 @@ function onDown(e) {
     return;
   }
 
+  // Compass rose tap → cycle sound palette
+  { const cx = unit * 0.06, cy = unit * 0.06;
+    const hr = Math.max(unit * 0.04, MIN_HIT);
+    if ((px - cx) * (px - cx) + (py - cy) * (py - cy) < hr * hr) {
+      switchSoundPalette();
+      return;
+    }
+  }
+
   const hit = hitTest(px, py);
 
   // Double-tap center → remove (edge taps don't count — those are volume knob)
@@ -1163,7 +1787,7 @@ function onMove(e) {
     while (delta < -Math.PI) delta += Math.PI * 2;
     s.volAngle = clamp(s.volAngle + delta, -VOL_MAX, VOL_MAX);
     drag.prevAngle = angle;
-    if (s.synth) s.synth.setVol(shapeVolume(s));
+    if (s.synth) s.synth.setVol(shapeVolume(s) + Math.min(s.proxBoost || 0, 0.3));
   } else {
     s.x = clamp(mx / W + drag.ox, 0.03, 0.97);
     s.y = clamp(my / H + drag.oy, 0.03, 0.97);
@@ -1209,7 +1833,7 @@ cvs.addEventListener('wheel', (e) => {
     const s = hit.shape;
     // deltaY > 0 = scroll down = quieter (counterclockwise)
     s.volAngle = clamp(s.volAngle - e.deltaY * 0.009, -3 * Math.PI, 3 * Math.PI);
-    if (s.synth) s.synth.setVol(shapeVolume(s));
+    if (s.synth) s.synth.setVol(shapeVolume(s) + Math.min(s.proxBoost || 0, 0.3));
   }
 }, { passive: false });
 
@@ -1234,6 +1858,9 @@ function draw(time) {
   if (masterGain && actx && actx.state === 'running') {
     shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying) attachSynth(s); });
   }
+
+  // Tick swell envelopes — JS drives the envelope gain each frame
+  shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.tick(); });
 
   // Fade transitions
   shapes.forEach(s => {
