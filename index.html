@@ -218,7 +218,16 @@ function startSwellCycle(gainNode, baseVol) {
     return cFloor;
   }
 
-  cycle();
+  // Start first cycle already at peak (in hold phase) to avoid sudden shrink on attach
+  cPeak = 0.7 + Math.random() * 0.3;
+  cFloor = 0.03;
+  cRise = 0;
+  cHold = 2 + Math.random() * 3;
+  cFall = 3 + Math.random() * 4;
+  const firstRest = 2 + Math.random() * 5;
+  cStart = actx.currentTime;
+  timeout = setTimeout(cycle, (cHold + cFall + firstRest) * 1000);
+
   return {
     getValue() { return computeValue(); },
     // Called every frame from the render loop — sets envelope gain directly
@@ -1526,10 +1535,9 @@ function drawShape(shape, time) {
     const knob = clamp(1 + (shape.volAngle || 0) / (VOL_TURNS * Math.PI), 0, 2);
     sc *= 0.5 + knob * 0.5;
     // Swell breathing: shapes physically grow/shrink with the swell envelope
-    if (shape.synth && shape.synth.swell) {
-      const sv = shape.synth.swell.getValue();  // 0..1
-      sc *= 0.6 + sv * 0.4;  // range: 60%–100% of current size
-    }
+    // Default to 1.0 (full size) when synth hasn't attached yet
+    const sv = (shape.synth && shape.synth.swell) ? shape.synth.swell.getValue() : 1.0;
+    sc *= 0.6 + sv * 0.4;  // range: 60%–100% of current size
   }
 
   // Glow when proximate
@@ -1939,8 +1947,8 @@ function draw(time) {
         : 0.35 * (1 - (elapsed - holdTime) / (dur - holdTime));
       ctx.save();
       ctx.strokeStyle = `rgba(180,200,255,${alpha})`;
-      ctx.lineWidth = 1.2 * devicePixelRatio;
-      ctx.setLineDash([4 * devicePixelRatio, 6 * devicePixelRatio]);
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([4, 6]);
       ctx.beginPath();
       constellationGuide.lines.forEach(([x1, y1, x2, y2]) => {
         ctx.moveTo(x1 * W, y1 * H);
