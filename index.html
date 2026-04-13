@@ -794,7 +794,8 @@ function buildCrystalPentagonSynth(freq) {
   return { out, envelope, swell,
     setFreq(f) {
       curFreq = f;
-      pluck();  // immediate re-pluck at new pitch
+      // Don't re-pluck on every call — just update freq for next scheduled pluck.
+      // This prevents audio graph explosion when shapes move continuously (throw/drift).
     },
     setVol(v) { out.gain.cancelScheduledValues(0); out.gain.value = v; },
     destroy() {
@@ -1454,8 +1455,9 @@ function ejectShape(s, star, angle) {
   const speed = 0.5 + Math.random() * 0.6;
   s.vx = Math.cos(angle) * speed;
   s.vy = Math.sin(angle) * speed;
+  // Re-attach synth (was detached on swallow)
+  if (!s.synth && masterGain && actx && actx.state === 'running') attachSynth(s);
   if (s.synth) {
-    if (s.synth.swell) s.synth.swell.resume();
     s.synth.setVol(shapeVolume(s) + Math.min(s.proxBoost || 0, 0.3));
   }
   updateShapeAudio(s);
@@ -1512,8 +1514,7 @@ function updateSwallows() {
         s.swallowStartX = s.x;
         s.swallowStartY = s.y;
         if (s.synth) {
-          if (s.synth.swell) s.synth.swell.pause();
-          s.synth.setVol(0);
+          detachSynth(s);
         }
         playSwallowSound();
       }
@@ -2271,7 +2272,7 @@ function draw(time) {
 
   // Late-attach synths — only when context is running
   if (masterGain && actx && actx.state === 'running') {
-    shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying) attachSynth(s); });
+    shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying && !s.swallowed) attachSynth(s); });
   }
 
   // Tick swell envelopes — JS drives the envelope gain each frame
