@@ -37,6 +37,7 @@ const SHAPE_DEFS = {
   square:   { color: [80,150,200],  breath: 'tick',   bRate: 0.60, bAmt: 0.045, rough: 1.0, fill: 'hachure',     hAng:   0, hGap: 5 },
   pentagon: { color: [170,110,210], breath: 'drift',  bRate: 0.05, bAmt: 0.10,  rough: 1.6, fill: 'hachure',     hAng:  30, hGap: 5 },
   hexagon:  { color: [100,190,130], breath: 'kick',   bRate: 0.30, bAmt: 0.06,  rough: 1.3, fill: 'hachure',     hAng: -60, hGap: 5 },
+  darkstar: { color: [5,3,2],       breath: 'spin',   bRate: 0.04, bAmt: 1.0,   rough: 0,   fill: 'solid',       hAng:   0, hGap: 0 },
 };
 
 const TYPES       = Object.keys(SHAPE_DEFS);
@@ -1175,6 +1176,7 @@ function resumeAllSwells() {
 
 function attachSynth(shape) {
   if (shape.synth || shape.isPalette || !masterGain) return;
+  if (shape.type === 'darkstar') return; // silent — it absorbs sound
   const freq = pitchFromY(shape.y);
   let synth;
 
@@ -1291,7 +1293,7 @@ function drawProximityLines() {
 function updateMomentum(dt) {
   let moved = false;
   shapes.forEach(s => {
-    if (s.isPalette || s.dying || (drag && drag.shape === s)) return;
+    if (s.isPalette || s.dying || s.swallowed || (drag && drag.shape === s)) return;
     if (!s.vx && !s.vy) return;
     s.x += s.vx * dt;
     s.y += s.vy * dt;
@@ -1327,7 +1329,7 @@ function updateDrift() {
   if (!driftActive) return;
   let moved = false;
   shapes.forEach(s => {
-    if (s.isPalette || s.dying || (drag && drag.shape === s)) return;
+    if (s.isPalette || s.dying || s.swallowed || (drag && drag.shape === s)) return;
     s.driftAngle += s.driftOmega;
     s.x += Math.cos(s.driftAngle) * s.driftSpeed;
     s.y += Math.sin(s.driftAngle) * s.driftSpeed;
@@ -1384,6 +1386,148 @@ function hitDriftBtn(px, py) {
   const { x, y, r } = driftBtnGeom();
   const dx = px - x, dy = py - y;
   return dx * dx + dy * dy < (r * 2.5) * (r * 2.5);
+}
+
+/* =============================================================
+   DARK STAR — swallow and disgorge
+   ============================================================= */
+
+const SWALLOW_FADE_MS  = 700;   // ingestion animation: shape shrinks into star
+const DISGORGE_WARN_MS = 900;   // pre-disgorge: star shrinks then explodes open
+
+function playSwallowSound() {
+  if (!audioOK || !actx || !masterGain) return;
+  const now = actx.currentTime;
+  // Descending whoosh: bandpass-filtered noise swept rapidly downward
+  const src = actx.createBufferSource();
+  src.buffer = getNoiseBuffer();
+  const bp = actx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(3500, now);
+  bp.frequency.exponentialRampToValueAtTime(55, now + 0.65);
+  bp.Q.value = 4;
+  const gain = actx.createGain();
+  gain.gain.setValueAtTime(0.5, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.65);
+  src.connect(bp); bp.connect(gain); gain.connect(masterGain);
+  src.start(now); src.stop(now + 0.7);
+}
+
+function playDisgorgeSound() {
+  if (!audioOK || !actx || !masterGain) return;
+  const now = actx.currentTime;
+  // Gentle pop: soft sine thump, short and quiet
+  const osc = actx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(180, now);
+  osc.frequency.exponentialRampToValueAtTime(80, now + 0.12);
+  const oscEnv = actx.createGain();
+  oscEnv.gain.setValueAtTime(0.18, now);
+  oscEnv.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+  osc.connect(oscEnv); oscEnv.connect(masterGain);
+  osc.start(now); osc.stop(now + 0.2);
+}
+
+function playConsumeSound() {
+  if (!audioOK || !actx || !masterGain) return;
+  const now = actx.currentTime;
+  // Mournful descending sine — something slipping away for good
+  const osc = actx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(380, now);
+  osc.frequency.exponentialRampToValueAtTime(55, now + 2.2);
+  const oscEnv = actx.createGain();
+  oscEnv.gain.setValueAtTime(0.15, now);
+  oscEnv.gain.exponentialRampToValueAtTime(0.001, now + 2.4);
+  osc.connect(oscEnv); oscEnv.connect(masterGain);
+  osc.start(now); osc.stop(now + 2.5);
+}
+
+// Eject a shape from a dark star at a given angle; returns the angle used.
+function ejectShape(s, star, angle) {
+  s.swallowed = false;
+  s.swallowedBy = null;
+  const dist = (star.size * unit) * (1.4 + Math.random() * 0.5);
+  s.x = clamp(star.x + Math.cos(angle) * dist / W, 0.05, 0.95);
+  s.y = clamp(star.y + Math.sin(angle) * dist / H, 0.05, PAL_ZONE - 0.05);
+  s.swallowStartX = s.x; s.swallowStartY = s.y;
+  const speed = 0.5 + Math.random() * 0.6;
+  s.vx = Math.cos(angle) * speed;
+  s.vy = Math.sin(angle) * speed;
+  if (s.synth) {
+    if (s.synth.swell) s.synth.swell.resume();
+    s.synth.setVol(shapeVolume(s) + Math.min(s.proxBoost || 0, 0.3));
+  }
+  updateShapeAudio(s);
+}
+
+function disgorge(s, star) {
+  const angle = Math.random() * Math.PI * 2;
+  ejectShape(s, star, angle);
+
+  // Clone: eject a twin in the opposite direction
+  const clone = makeShape(s.type, star.x, star.y, false);
+  clone.volAngle = s.volAngle;
+  clone.rgb = [s.rgb[0], s.rgb[1], s.rgb[2]];
+  clone._dirty = true;
+  if (driftActive) {
+    clone.driftAngle = Math.random() * Math.PI * 2;
+    clone.driftSpeed = 0.00025 + Math.random() * 0.00025;
+    clone.driftOmega = (Math.random() - 0.5) * 0.0015;
+  }
+  shapes.push(clone);
+  if (masterGain && actx && actx.state === 'running') attachSynth(clone);
+  ejectShape(clone, star, angle + Math.PI + (Math.random() - 0.5) * 0.8);
+
+  recomputeProximity();
+  playDisgorgeSound();
+}
+
+function consume(s) {
+  // Shape is gone — remove it silently then play the loss sound
+  s.swallowed = false;
+  s.swallowedBy = null;
+  detachSynth(s);
+  const idx = shapes.indexOf(s);
+  if (idx >= 0) shapes.splice(idx, 1);
+  recomputeProximity();
+  playConsumeSound();
+}
+
+function updateSwallows() {
+  const now = performance.now();
+  shapes.forEach(star => {
+    if (star.type !== 'darkstar' || star.dying) return;
+    const pullRadius = star.size * unit * 0.75;
+    shapes.forEach(s => {
+      if (s === star || s.type === 'darkstar' || s.dying || s.isPalette) return;
+      if (s.swallowed || (drag && drag.shape === s)) return;
+      if (pxDist(star, s) < pullRadius) {
+        // Swallow
+        s.swallowed = true;
+        s.swallowedBy = star;
+        s.swallowTime = now;
+        s.swallowDuration = 3000 + Math.random() * 4000;
+        s.swallowFate = Math.random() < 0.5 ? 'clone' : 'consume';
+        s.swallowStartX = s.x;
+        s.swallowStartY = s.y;
+        if (s.synth) {
+          if (s.synth.swell) s.synth.swell.pause();
+          s.synth.setVol(0);
+        }
+        playSwallowSound();
+      }
+    });
+  });
+  // Check for disgorge or consume
+  shapes.forEach(s => {
+    if (!s.swallowed) return;
+    if (now - s.swallowTime > s.swallowDuration) {
+      const star = s.swallowedBy || { x: 0.5, y: 0.4, size: BASE_SIZE };
+      if (s.swallowFate === 'consume') consume(s);
+      else disgorge(s, star);
+    }
+  });
 }
 
 /* =============================================================
@@ -1502,7 +1646,8 @@ function makeShape(type, x, y, asPalette) {
   const v = asPalette ? 0 : 18;
   return {
     id: nextId++, type, x, y,
-    size: asPalette ? BASE_SIZE * PAL_SCALE : BASE_SIZE + (Math.random() - 0.5) * SIZE_VARY * 2,
+    size: asPalette ? BASE_SIZE * PAL_SCALE * (type === 'darkstar' ? 0.5 : 1)
+                    : (BASE_SIZE + (Math.random() - 0.5) * SIZE_VARY * 2) * (type === 'darkstar' ? 0.5 : 1),
     rgb: [
       clamp(Math.round(cr + (Math.random() - 0.5) * v), 0, 255),
       clamp(Math.round(cg + (Math.random() - 0.5) * v), 0, 255),
@@ -1580,6 +1725,27 @@ function cacheShape(shape) {
       crc.polygon(pts, opts);
       break;
     }
+    case 'darkstar': {
+      // 7-pointed star: solid near-black, no outline, no sketch texture
+      const n = 7, R = sz * 0.52, r = sz * 0.21;
+      const pts = [];
+      for (let i = 0; i < n * 2; i++) {
+        const a = (i * Math.PI / n) - Math.PI / 2;
+        const rad = i % 2 === 0 ? R : r;
+        pts.push([mid + Math.cos(a) * rad, mid + Math.sin(a) * rad]);
+      }
+      // Draw directly with plain canvas — no roughness, no stroke
+      const dc = c.getContext('2d');
+      dc.fillStyle = 'rgb(5, 3, 2)';
+      dc.beginPath();
+      dc.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) dc.lineTo(pts[i][0], pts[i][1]);
+      dc.closePath();
+      dc.fill();
+      shape._cache = c;
+      shape._dirty = false;
+      return; // skip construction mark and normal cache assignment
+    }
   }
 
   // Construction mark: center dot
@@ -1594,6 +1760,27 @@ function cacheShape(shape) {
 }
 
 function drawShape(shape, time) {
+  // Swallowed: animate ingestion (shape shrinks and slides into the dark star)
+  if (shape.swallowed) {
+    const star = shape.swallowedBy;
+    if (!star) return;
+    const elapsed = performance.now() - shape.swallowTime;
+    if (elapsed >= SWALLOW_FADE_MS) return; // fully inside, invisible
+    if (shape._dirty || !shape._cache) cacheShape(shape);
+    if (!shape._cache) return;
+    const t = elapsed / SWALLOW_FADE_MS;
+    const q = t * t; // quadratic ease-in — accelerates toward the star
+    const drawX = (shape.swallowStartX * (1 - q) + star.x * q) * W;
+    const drawY = (shape.swallowStartY * (1 - q) + star.y * q) * H;
+    ctx.save();
+    ctx.globalAlpha = 1 - t;
+    ctx.translate(drawX, drawY);
+    ctx.scale(1 - q, 1 - q);
+    ctx.drawImage(shape._cache, -shape._cache.width / 2, -shape._cache.height / 2);
+    ctx.restore();
+    return;
+  }
+
   if (shape._dirty || !shape._cache) cacheShape(shape);
   if (!shape._cache) return;
 
@@ -1629,13 +1816,17 @@ function drawShape(shape, time) {
         const hit = Math.max(0, 1 - phase / 1.2);
         sc = 1 + hit * hit * def.bAmt * 3; }
       break;
+    case 'spin':
+      // Slow continuous rotation — like a black hole turning
+      rot = bp * def.bAmt;
+      break;
   }
 
   // Lift when dragging
   if (drag && drag.shape === shape) sc *= 1.1;
 
   // Scale by volume knob: mute (0x) → 0.5 size, default (1x) → 1.0, max (2x) → 1.5
-  if (!shape.isPalette) {
+  if (!shape.isPalette && shape.type !== 'darkstar') {
     const VOL_TURNS = 3;
     const knob = clamp(1 + (shape.volAngle || 0) / (VOL_TURNS * Math.PI), 0, 2);
     sc *= 0.5 + knob * 0.5;
@@ -1643,6 +1834,32 @@ function drawShape(shape, time) {
     // Default to 1.0 (full size) when synth hasn't attached yet
     const sv = (shape.synth && shape.synth.swell) ? shape.synth.swell.getValue() : 1.0;
     sc *= 0.6 + sv * 0.4;  // range: 60%–100% of current size
+  }
+
+  // Dark star pulsation — while digesting: slow throb; pre-disgorge: shrink then burst
+  if (shape.type === 'darkstar' && !shape.isPalette) {
+    const now = performance.now();
+    let pulse = 1, digesting = false;
+    shapes.forEach(s => {
+      if (s.swallowedBy !== shape || !s.swallowed) return;
+      const elapsed = now - s.swallowTime;
+      const remaining = s.swallowDuration - elapsed;
+      if (remaining < DISGORGE_WARN_MS && remaining > 0) {
+        // Shrink-then-explode: first half shrinks, second half grows rapidly
+        const t = 1 - remaining / DISGORGE_WARN_MS; // 0→1
+        if (t < 0.5) {
+          pulse = 1 - (t / 0.5) * 0.25;         // 1.0 → 0.75
+        } else {
+          const p = (t - 0.5) / 0.5;            // 0→1
+          pulse = 0.75 + p * p * 0.55;          // 0.75 → 1.30
+        }
+      } else if (elapsed > SWALLOW_FADE_MS) {
+        // Subtle pulsation while digesting (~1.4 Hz)
+        digesting = true;
+        pulse = Math.max(pulse, 1 + Math.sin(now * 0.0088) * 0.10);
+      }
+    });
+    sc *= clamp(pulse, 0.3, 2.6);
   }
 
   // Glow when proximate
@@ -1653,6 +1870,13 @@ function drawShape(shape, time) {
   ctx.translate(shape.x * W, shape.y * H);
   ctx.rotate(rot + (shape.volAngle || 0));
   ctx.scale(sc, sc);
+
+  // Dark star: no glow, no luminosity — just the void
+  if (shape.type === 'darkstar') {
+    ctx.drawImage(shape._cache, -shape._cache.width / 2, -shape._cache.height / 2);
+    ctx.restore();
+    return;
+  }
 
   // Subtle proximity glow halo
   if (glow > 0.02 && !shape.isPalette) {
@@ -1687,7 +1911,12 @@ function drawShape(shape, time) {
 function removeShape(shape) {
   if (shape.dying) return;
   shape.dying = true;
-  // Fade audio out in parallel
+  // If removing a dark star, immediately disgorge anything it swallowed
+  if (shape.type === 'darkstar') {
+    shapes.forEach(s => {
+      if (s.swallowedBy === shape) { ejectShape(s, shape, Math.random() * Math.PI * 2); s.swallowed = false; s.swallowedBy = null; }
+    });
+  }
   detachSynth(shape);
   recomputeProximity();
 }
@@ -1825,7 +2054,7 @@ function hitTest(px, py) {
   const EDGE_INNER = 0.55;  // fraction of hit radius — inside this is 'center'
   for (let i = shapes.length - 1; i >= 0; i--) {
     const s = shapes[i];
-    if (s.dying) continue;
+    if (s.dying || s.swallowed) continue;
     const dx = px - s.x * W, dy = py - s.y * H;
     const dist = Math.sqrt(dx * dx + dy * dy);
     const hr = Math.max(s.size * unit * 0.55, MIN_HIT);
@@ -2054,10 +2283,17 @@ function draw(time) {
   // Drift — planetary motion
   updateDrift();
 
+  // Swallow detection
+  updateSwallows();
+
   // Fade transitions
   shapes.forEach(s => {
     if (s.dying) {
       s.opacity = Math.max(0, s.opacity - 0.025);
+    } else if (s.swallowed) {
+      // drawShape handles ingestion alpha from elapsed time;
+      // once fully inside, zero opacity so disgorge fades back in naturally
+      if (performance.now() - s.swallowTime >= SWALLOW_FADE_MS) s.opacity = 0;
     } else if (s.opacity < s.fadeTarget) {
       s.opacity = Math.min(s.fadeTarget, s.opacity + 0.02);
     }
@@ -2224,8 +2460,9 @@ function initScene() {
   types.push(tonal[Math.floor(Math.random() * tonal.length)]);
   types.push(tonal[Math.floor(Math.random() * tonal.length)]);
   types.push(rhythm[Math.floor(Math.random() * rhythm.length)]);
+  const spawnable = [...tonal, ...rhythm]; // darkstar not in random scene
   while (types.length < count) {
-    types.push(TYPES[Math.floor(Math.random() * TYPES.length)]);
+    types.push(spawnable[Math.floor(Math.random() * spawnable.length)]);
   }
   for (let i = types.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
