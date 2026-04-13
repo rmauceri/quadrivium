@@ -69,6 +69,8 @@ let proxPairs = [];
 let nextId   = 1;
 let volumeVal = 0.3;
 let volDrag   = false;
+let driftActive = false;
+let lastTime = 0;
 let motes    = [];   // floating dust particles
 let soundPalette = Math.floor(Math.random() * 3); // randomize on each load
 
@@ -1283,6 +1285,108 @@ function drawProximityLines() {
 }
 
 /* =============================================================
+   DRIFT — planetary motion on curved toroidal paths
+   ============================================================= */
+
+function updateMomentum(dt) {
+  let moved = false;
+  shapes.forEach(s => {
+    if (s.isPalette || s.dying || (drag && drag.shape === s)) return;
+    if (!s.vx && !s.vy) return;
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    // Toroidal wrap
+    if (s.x < 0) s.x += 1;
+    if (s.x > 1) s.x -= 1;
+    if (s.y < 0) s.y += PAL_ZONE;
+    if (s.y > PAL_ZONE) s.y -= PAL_ZONE;
+    // Exponential decay: ~5% speed remaining after 1.5 seconds
+    const DRAG = Math.pow(0.05, dt);
+    s.vx *= DRAG;
+    s.vy *= DRAG;
+    if (Math.abs(s.vx) < 0.0005 && Math.abs(s.vy) < 0.0005) { s.vx = 0; s.vy = 0; }
+    updateShapeAudio(s);
+    moved = true;
+  });
+  if (moved) recomputeProximity();
+}
+
+function toggleDrift() {
+  driftActive = !driftActive;
+  if (driftActive) {
+    shapes.forEach(s => {
+      if (s.isPalette || s.dying) return;
+      s.driftAngle = Math.random() * Math.PI * 2;
+      s.driftSpeed = 0.00025 + Math.random() * 0.00025;
+      s.driftOmega = (Math.random() - 0.5) * 0.0015;
+    });
+  }
+}
+
+function updateDrift() {
+  if (!driftActive) return;
+  let moved = false;
+  shapes.forEach(s => {
+    if (s.isPalette || s.dying || (drag && drag.shape === s)) return;
+    s.driftAngle += s.driftOmega;
+    s.x += Math.cos(s.driftAngle) * s.driftSpeed;
+    s.y += Math.sin(s.driftAngle) * s.driftSpeed;
+    // Toroidal wrapping
+    if (s.x < 0) s.x += 1;
+    if (s.x > 1) s.x -= 1;
+    if (s.y < 0) s.y += PAL_ZONE;
+    if (s.y > PAL_ZONE) s.y -= PAL_ZONE;
+    updateShapeAudio(s);
+    moved = true;
+  });
+  if (moved) recomputeProximity();
+}
+
+function driftBtnGeom() {
+  const x = (1 - 0.06) * W;
+  const y = H * (PAL_ZONE + 0.05);
+  const r = Math.max(10, unit * 0.018);
+  return { x, y, r };
+}
+
+function drawDriftBtn(time) {
+  const { x, y, r } = driftBtnGeom();
+  const alpha = driftActive ? 0.65 : 0.22;
+  const stroke = driftActive
+    ? `rgba(180,210,255,${alpha})`
+    : `rgba(180,170,155,${alpha})`;
+  const fill = driftActive
+    ? `rgba(180,210,255,0.10)`
+    : `rgba(180,170,155,0.03)`;
+
+  // Orbit ellipse — tilted, slowly rotates when active
+  ctx.save();
+  ctx.translate(x, y);
+  if (driftActive) ctx.rotate(time * 0.0003);
+  const ew = r * 2.6, eh = r * 1.1;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, ew / 2, eh / 2, 0.42, 0, Math.PI * 2);
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = driftActive ? 1.1 : 0.7;
+  ctx.stroke();
+  // Planet dot on the orbit ring
+  const angle = driftActive ? (time * 0.0008) : 0.42;
+  const px = Math.cos(angle) * ew / 2;
+  const py = Math.sin(angle) * eh / 2;
+  ctx.beginPath();
+  ctx.arc(px, py, Math.max(2.5, r * 0.22), 0, Math.PI * 2);
+  ctx.fillStyle = stroke;
+  ctx.fill();
+  ctx.restore();
+}
+
+function hitDriftBtn(px, py) {
+  const { x, y, r } = driftBtnGeom();
+  const dx = px - x, dy = py - y;
+  return dx * dx + dy * dy < (r * 2.5) * (r * 2.5);
+}
+
+/* =============================================================
    DUST MOTES — luminous particles drifting across the table
    ============================================================= */
 
@@ -1407,6 +1511,7 @@ function makeShape(type, x, y, asPalette) {
     phase: Math.random() * Math.PI * 2,
     seed: Math.floor(Math.random() * 1e6),
     volAngle: 0,       // rotation offset from volume knob (radians, 0 = default vol)
+    vx: 0, vy: 0,     // throw momentum (normalized coords/sec)
     synth: null, extras: [],
     opacity: asPalette ? 0.55 : 0,    // non-palette shapes fade in from 0
     fadeTarget: asPalette ? 0.55 : 1,
@@ -1765,6 +1870,12 @@ function onDown(e) {
     }
   }
 
+  // Drift button tap → toggle drift
+  if (hitDriftBtn(px, py)) {
+    toggleDrift();
+    return;
+  }
+
   const hit = hitTest(px, py);
 
   // Double-tap center → remove (edge taps don't count — those are volume knob)
@@ -1788,6 +1899,11 @@ function onDown(e) {
     const ns = makeShape(tmpl.type, tmpl.x, tmpl.y, false);
     shapes.push(ns);
     if (masterGain) attachSynth(ns);
+    if (driftActive) {
+      ns.driftAngle = Math.random() * Math.PI * 2;
+      ns.driftSpeed = 0.00025 + Math.random() * 0.00025;
+      ns.driftOmega = (Math.random() - 0.5) * 0.0015;
+    }
     drag = { shape: ns, ox: 0, oy: 0, fromPal: true };
   } else if (hit.zone === 'edge') {
     // Edge drag → rotate = volume knob (incremental accumulation for multi-turn)
@@ -1834,6 +1950,11 @@ function onMove(e) {
   } else {
     s.x = clamp(mx / W + drag.ox, 0.03, 0.97);
     s.y = clamp(my / H + drag.oy, 0.03, 0.97);
+    // Track recent positions for throw velocity
+    const now = performance.now();
+    if (!drag.history) drag.history = [];
+    drag.history.push({ x: s.x, y: s.y, t: now });
+    if (drag.history.length > 8) drag.history.shift();
     updateShapeAudio(s);
     recomputeProximity();
   }
@@ -1845,10 +1966,29 @@ function onUp(e) {
   const s = drag.shape;
 
   // Remove if dropped into palette zone (unless freshly created from palette and not moved up)
+  let removed = false;
   if (drag.fromPal && s.y > PAL_ZONE - 0.03) {
-    removeShape(s);
+    removeShape(s); removed = true;
   } else if (!drag.fromPal && s.y > PAL_ZONE + 0.02) {
-    removeShape(s);
+    removeShape(s); removed = true;
+  }
+
+  // Compute throw velocity from recent drag history
+  if (!removed && !drag.mode) {
+    const hist = drag.history;
+    if (hist && hist.length >= 2) {
+      const now = performance.now();
+      const recent = hist.filter(p => now - p.t < 80);
+      if (recent.length >= 2) {
+        const first = recent[0], last = recent[recent.length - 1];
+        const dt = (last.t - first.t) / 1000;
+        if (dt > 0.005) {
+          const MAX_V = 5;
+          s.vx = clamp((last.x - first.x) / dt, -MAX_V, MAX_V);
+          s.vy = clamp((last.y - first.y) / dt, -MAX_V, MAX_V);
+        }
+      }
+    }
   }
 
   drag = null;
@@ -1897,6 +2037,9 @@ document.addEventListener('touchstart', () => {
 function draw(time) {
   requestAnimationFrame(draw);
 
+  const dt = Math.min((time - lastTime) / 1000, 0.05); // seconds, capped at 50ms
+  lastTime = time;
+
   // Late-attach synths — only when context is running
   if (masterGain && actx && actx.state === 'running') {
     shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying) attachSynth(s); });
@@ -1904,6 +2047,12 @@ function draw(time) {
 
   // Tick swell envelopes — JS drives the envelope gain each frame
   shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.tick(); });
+
+  // Throw momentum
+  updateMomentum(dt);
+
+  // Drift — planetary motion
+  updateDrift();
 
   // Fade transitions
   shapes.forEach(s => {
@@ -1981,8 +2130,9 @@ function draw(time) {
   // Palette shapes
   palette.forEach(s => drawShape(s, time));
 
-  // Volume slider
+  // Volume slider + drift button
   drawVolumeSlider();
+  drawDriftBtn(time);
 
   // Grain overlay
   if (grainCvs) {
