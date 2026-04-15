@@ -53,6 +53,7 @@ const GRAV_SOFTEN = 0.08;    // softening radius — prevents singularity when s
 // Singularity — The Great Collapse
 const SING_CRIT    = 0.12;   // normalized distance: dark stars merge
 const SING_WARN    = 0.36;   // 3× critical — warning begins
+const GOLDEN_ANGLE = 0.381966;  // 137.508° / 360° — never-repeating hue rotation
 const SING_COLLAPSE_MS = 4200;
 const SING_VOID_MS     = 1500;
 const SING_EXPAND_MS   = 2500;
@@ -2111,11 +2112,11 @@ function updateVoid(elapsed) {
 function applyTransformation() {
   singCount++;
 
-  // Hue-rotate surviving shapes by 180°
+  // Hue-rotate surviving shapes by golden angle (~137.5°) — never repeats
   shapes.forEach(s => {
     if (s.isPalette || s.type === 'darkstar') return;
     const [h, sat, l] = rgbToHsl(...s.rgb);
-    s.rgb = hslToRgb((h + 0.5) % 1, sat, l);
+    s.rgb = hslToRgb((h + GOLDEN_ANGLE) % 1, sat, l);
     s._dirty = true;
   });
 
@@ -2123,7 +2124,7 @@ function applyTransformation() {
   palette.forEach(s => {
     if (s.type === 'darkstar') return;
     const [h, sat, l] = rgbToHsl(...s.rgb);
-    s.rgb = hslToRgb((h + 0.5) % 1, sat, l);
+    s.rgb = hslToRgb((h + GOLDEN_ANGLE) % 1, sat, l);
     s._dirty = true;
   });
 
@@ -2209,7 +2210,7 @@ function beginExpansion(time) {
       }
       // Hue-rotate new shape to match transformed universe
       const [h, sat, l] = rgbToHsl(...ns.rgb);
-      ns.rgb = hslToRgb((h + 0.5 * singCount) % 1, sat, l);
+      ns.rgb = hslToRgb((h + GOLDEN_ANGLE * singCount) % 1, sat, l);
       ns._dirty = true;
       shapes.push(ns);
       singTargets[ns.id] = { x: placed[i][0], y: placed[i][1] };
