@@ -47,6 +47,8 @@ const PAL_SCALE   = 0.55;
 const PAL_Y       = 0.93;
 const PAL_ZONE    = 0.87;
 const PROX_FRAC   = 0.28;
+const GRAVITY_AMP = 0.003;   // dark star gravity amplitude — oscillates ±this value
+const GRAV_SOFTEN = 0.08;    // softening radius — prevents singularity when shapes overlap
 const MIN_HIT     = 44;
 const DBL_TAP_MS  = 350;
 const DOT_SP      = 0.03;
@@ -1288,21 +1290,46 @@ function drawProximityLines() {
 }
 
 /* =============================================================
-   DRIFT — planetary motion on curved toroidal paths
+   DRIFT — planetary motion with wall bouncing
    ============================================================= */
+
+function updateGravity(dt, time) {
+  // Each dark star has its own gravity frequency and phase.
+  // G oscillates between -GRAVITY_AMP and +GRAVITY_AMP (negative = repulsive).
+  const soften2 = GRAV_SOFTEN * GRAV_SOFTEN;
+  const stars  = shapes.filter(s => s.type === 'darkstar' && !s.dying && !s.swallowed);
+  const others = shapes.filter(s => s.type !== 'darkstar' && !s.isPalette && !s.dying && !s.swallowed);
+  if (!stars.length || !others.length) return;
+
+  for (const star of stars) {
+    const G = GRAVITY_AMP * Math.sin((time / star.gravPeriod) * Math.PI * 2 + star.gravPhase);
+    if (G === 0) continue;
+    for (const other of others) {
+      const dx = star.x - other.x;
+      const dy = star.y - other.y;
+      const d2 = dx * dx + dy * dy + soften2;
+      const d  = Math.sqrt(d2);
+      const f  = G * dt / d2;
+      const fx = f * dx / d;
+      const fy = f * dy / d;
+      if (!(drag && drag.shape === other)) { other.vx += fx; other.vy += fy; }
+      if (!(drag && drag.shape === star))  { star.vx  -= fx; star.vy  -= fy; }
+    }
+  }
+}
 
 function updateMomentum(dt) {
   let moved = false;
   shapes.forEach(s => {
     if (s.isPalette || s.dying || s.swallowed || (drag && drag.shape === s)) return;
-    if (!s.vx && !s.vy) return;
     s.x += s.vx * dt;
     s.y += s.vy * dt;
-    // Toroidal wrap
-    if (s.x < 0) s.x += 1;
-    if (s.x > 1) s.x -= 1;
-    if (s.y < 0) s.y += PAL_ZONE;
-    if (s.y > PAL_ZONE) s.y -= PAL_ZONE;
+    // Bounce off walls (margin = shape radius in normalized coords)
+    const mx = s.size * 0.5, my = s.size * 0.5 * (W / H);
+    if (s.x < mx)           { s.x = mx;           s.vx = Math.abs(s.vx); }
+    if (s.x > 1 - mx)       { s.x = 1 - mx;       s.vx = -Math.abs(s.vx); }
+    if (s.y < my)           { s.y = my;            s.vy = Math.abs(s.vy); }
+    if (s.y > PAL_ZONE - my){ s.y = PAL_ZONE - my; s.vy = -Math.abs(s.vy); }
     // Exponential decay: ~5% speed remaining after 1.5 seconds
     const DRAG = Math.pow(0.05, dt);
     s.vx *= DRAG;
@@ -1334,11 +1361,12 @@ function updateDrift() {
     s.driftAngle += s.driftOmega;
     s.x += Math.cos(s.driftAngle) * s.driftSpeed;
     s.y += Math.sin(s.driftAngle) * s.driftSpeed;
-    // Toroidal wrapping
-    if (s.x < 0) s.x += 1;
-    if (s.x > 1) s.x -= 1;
-    if (s.y < 0) s.y += PAL_ZONE;
-    if (s.y > PAL_ZONE) s.y -= PAL_ZONE;
+    // Bounce off walls
+    const mx = s.size * 0.5, my = s.size * 0.5 * (W / H);
+    if (s.x < mx)            { s.x = mx;            s.driftAngle = Math.PI - s.driftAngle; }
+    if (s.x > 1 - mx)        { s.x = 1 - mx;        s.driftAngle = Math.PI - s.driftAngle; }
+    if (s.y < my)            { s.y = my;             s.driftAngle = -s.driftAngle; }
+    if (s.y > PAL_ZONE - my) { s.y = PAL_ZONE - my;  s.driftAngle = -s.driftAngle; }
     updateShapeAudio(s);
     moved = true;
   });
@@ -1516,6 +1544,7 @@ function updateSwallows() {
         if (s.synth) {
           detachSynth(s);
         }
+        star.gravPhase += Math.PI;  // flip gravity polarity on each swallow
         playSwallowSound();
       }
     });
@@ -1656,6 +1685,8 @@ function makeShape(type, x, y, asPalette) {
     ],
     phase: Math.random() * Math.PI * 2,
     seed: Math.floor(Math.random() * 1e6),
+    gravPhase: Math.random() * Math.PI * 2,
+    gravPeriod: 10000 + Math.random() * 14000,  // 10–24 s per cycle
     volAngle: 0,       // rotation offset from volume knob (radians, 0 = default vol)
     vx: 0, vy: 0,     // throw momentum (normalized coords/sec)
     synth: null, extras: [],
@@ -1680,6 +1711,15 @@ function cacheShape(shape) {
   const sa = shape.isPalette ? 0.65 : 0.85;
   const fa = shape.isPalette ? 0.12 : 0.20;
 
+  // Solid base — gives the shape body before hachure texture is laid on top
+  const baseOpts = {
+    stroke: 'none',
+    roughness: SHAPE_DEFS[shape.type].rough * 0.6,
+    fill: `rgba(${r},${g},${b},${shape.isPalette ? 0.10 : 0.22})`,
+    fillStyle: 'solid',
+    seed: shape.seed + 500,
+  };
+
   const opts = {
     stroke: `rgba(${r},${g},${b},${sa})`,
     strokeWidth: shape.isPalette ? 1 : 1.5,
@@ -1694,18 +1734,22 @@ function cacheShape(shape) {
 
   switch (shape.type) {
     case 'circle':
+      crc.circle(mid, mid, sz, baseOpts);
       crc.circle(mid, mid, sz, opts);
       break;
     case 'triangle': {
       const h = sz * 0.866;
-      crc.polygon([
+      const triPts = [
         [mid, mid - h * 0.55],
         [mid - sz * 0.5, mid + h * 0.45],
         [mid + sz * 0.5, mid + h * 0.45],
-      ], opts);
+      ];
+      crc.polygon(triPts, baseOpts);
+      crc.polygon(triPts, opts);
       break;
     }
     case 'square':
+      crc.rectangle(mid - sz * 0.45, mid - sz * 0.45, sz * 0.9, sz * 0.9, baseOpts);
       crc.rectangle(mid - sz * 0.45, mid - sz * 0.45, sz * 0.9, sz * 0.9, opts);
       break;
     case 'pentagon': {
@@ -1714,6 +1758,7 @@ function cacheShape(shape) {
         const a = (i / 5) * Math.PI * 2 - Math.PI / 2;
         pts.push([mid + Math.cos(a) * sz * 0.48, mid + Math.sin(a) * sz * 0.48]);
       }
+      crc.polygon(pts, baseOpts);
       crc.polygon(pts, opts);
       break;
     }
@@ -1723,6 +1768,7 @@ function cacheShape(shape) {
         const a = (i / 6) * Math.PI * 2;
         pts.push([mid + Math.cos(a) * sz * 0.48, mid + Math.sin(a) * sz * 0.48]);
       }
+      crc.polygon(pts, baseOpts);
       crc.polygon(pts, opts);
       break;
     }
@@ -1906,6 +1952,65 @@ function drawShape(shape, time) {
   }
 
   ctx.drawImage(shape._cache, -shape._cache.width / 2, -shape._cache.height / 2);
+
+  // World-space directional lighting: top-left source, fixed as shape turns.
+  // Clip to exact shape geometry so the gradient fills the whole interior,
+  // not just the sparse hachure lines.
+  if (!shape.isPalette && shape.type !== 'darkstar') {
+    const sz = shape.size * unit;
+    const totalRot = rot + (shape.volAngle || 0);
+
+    // Rotate world light dir (-0.707, -0.707) into shape-local (already-rotated) space
+    const lx = -0.707 * (Math.cos(totalRot) + Math.sin(totalRot));
+    const ly = -0.707 * (Math.cos(totalRot) - Math.sin(totalRot));
+
+    ctx.save();
+    ctx.beginPath();
+    switch (shape.type) {
+      case 'circle':
+        ctx.arc(0, 0, sz * 0.5, 0, Math.PI * 2);
+        break;
+      case 'triangle': {
+        const h = sz * 0.866;
+        ctx.moveTo(0, -h * 0.55);
+        ctx.lineTo(-sz * 0.5, h * 0.45);
+        ctx.lineTo( sz * 0.5, h * 0.45);
+        ctx.closePath();
+        break;
+      }
+      case 'square':
+        ctx.rect(-sz * 0.45, -sz * 0.45, sz * 0.9, sz * 0.9);
+        break;
+      case 'pentagon':
+        for (let i = 0; i < 5; i++) {
+          const a = (i / 5) * Math.PI * 2 - Math.PI / 2;
+          const vx = Math.cos(a) * sz * 0.48, vy = Math.sin(a) * sz * 0.48;
+          i === 0 ? ctx.moveTo(vx, vy) : ctx.lineTo(vx, vy);
+        }
+        ctx.closePath();
+        break;
+      case 'hexagon':
+        for (let i = 0; i < 6; i++) {
+          const a = (i / 6) * Math.PI * 2;
+          const vx = Math.cos(a) * sz * 0.48, vy = Math.sin(a) * sz * 0.48;
+          i === 0 ? ctx.moveTo(vx, vy) : ctx.lineTo(vx, vy);
+        }
+        ctx.closePath();
+        break;
+    }
+    ctx.clip();
+
+    const R = sz * 0.65;
+    const shadGrad = ctx.createLinearGradient(lx * R, ly * R, -lx * R, -ly * R);
+    shadGrad.addColorStop(0,    'rgba(255,255,255,0.28)');
+    shadGrad.addColorStop(0.40, 'rgba(255,255,255,0)');
+    shadGrad.addColorStop(0.60, 'rgba(0,0,0,0)');
+    shadGrad.addColorStop(1,    'rgba(0,0,0,0.38)');
+    ctx.fillStyle = shadGrad;
+    ctx.fillRect(-R * 1.5, -R * 1.5, R * 3, R * 3);
+    ctx.restore();
+  }
+
   ctx.restore();
 }
 
@@ -2278,7 +2383,10 @@ function draw(time) {
   // Tick swell envelopes — JS drives the envelope gain each frame
   shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.tick(); });
 
-  // Throw momentum
+  // Dark star gravity — oscillates between attractive and repulsive
+  updateGravity(dt, time);
+
+  // Throw momentum + gravity integration
   updateMomentum(dt);
 
   // Drift — planetary motion
