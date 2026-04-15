@@ -49,6 +49,14 @@ const PAL_ZONE    = 0.87;
 const PROX_FRAC   = 0.28;
 const GRAVITY_AMP = 0.003;   // dark star gravity amplitude — oscillates ±this value
 const GRAV_SOFTEN = 0.08;    // softening radius — prevents singularity when shapes overlap
+
+// Singularity — The Great Collapse
+const SING_CRIT    = 0.12;   // normalized distance: dark stars merge
+const SING_WARN    = 0.36;   // 3× critical — warning begins
+const SING_COLLAPSE_MS = 5000;
+const SING_VOID_MS     = 1500;
+const SING_EXPAND_MS   = 2500;
+const SING_SETTLE_MS   = 1500;
 const MIN_HIT     = 44;
 const DBL_TAP_MS  = 350;
 const DOT_SP      = 0.03;
@@ -76,6 +84,27 @@ let driftActive = false;
 let lastTime = 0;
 let motes    = [];   // floating dust particles
 let soundPalette = Math.floor(Math.random() * 3); // randomize on each load
+
+// Singularity state
+let singPhase  = null;  // null | 'warning' | 'collapse' | 'void' | 'expand' | 'settle'
+let singTime   = 0;     // performance.now() when current phase started
+let singCenter = null;  // {x, y} midpoint of the two dark stars
+let singCount  = 0;     // accumulates per session — drives background color shifts
+let singScars  = [];    // [{x, y, birth}] permanent visual marks
+let singStars  = null;  // [star1, star2] the triggering dark star pair
+let singHum    = null;  // {osc, gain} warning sub-bass audio nodes
+let singSnap   = {};    // shape.id → {x, y} positions before collapse
+let singTargets = {};   // shape.id → {x, y} target positions for expansion
+let singConstIdx = -1;  // constellation chosen for rebirth
+let singBgFrom = null;  // background color transitioning from
+let singBgTo   = null;  // background color transitioning to
+let singPulse  = 0;     // bright pulse progress during void
+
+// Dark star auto-spawn — seeds the next singularity cycle
+const DARKSTAR_SPAWN_DELAY = 20000; // ms after settling before spawning
+const DARKSTAR_MATERIALIZE_MS = 3000; // materialization animation duration
+let darkStarSpawnTimer = 0;  // timestamp when spawn countdown began (0 = inactive)
+let materializingStars = [];  // [{shape, startTime}] currently materializing
 
 const PALETTE_NAMES = ['Ether', 'Crystal', 'Void'];
 
@@ -1350,6 +1379,11 @@ function toggleDrift() {
       s.driftSpeed = 0.00025 + Math.random() * 0.00025;
       s.driftOmega = (Math.random() - 0.5) * 0.0015;
     });
+    // Kick off dark star spawn if none exist
+    const existingStars = shapes.filter(s => s.type === 'darkstar' && !s.dying && !s.isPalette);
+    if (existingStars.length === 0 && materializingStars.length === 0) {
+      darkStarSpawnTimer = performance.now();
+    }
   }
 }
 
@@ -1538,7 +1572,15 @@ function updateSwallows() {
         s.swallowedBy = star;
         s.swallowTime = now;
         s.swallowDuration = 3000 + Math.random() * 4000;
-        s.swallowFate = Math.random() < 0.5 ? 'clone' : 'consume';
+        // Population-aware fate: protect the board when shape count is low
+        const activeCount = shapes.filter(sh => !sh.isPalette && !sh.dying && !sh.swallowed && sh.type !== 'darkstar').length;
+        if (activeCount <= 5) {
+          s.swallowFate = 'clone';
+        } else if (activeCount <= 8) {
+          s.swallowFate = Math.random() < 0.75 ? 'clone' : 'consume';
+        } else {
+          s.swallowFate = Math.random() < 0.5 ? 'clone' : 'consume';
+        }
         s.swallowStartX = s.x;
         s.swallowStartY = s.y;
         if (s.synth) {
@@ -1557,6 +1599,1009 @@ function updateSwallows() {
       if (s.swallowFate === 'consume') consume(s);
       else disgorge(s, star);
     }
+  });
+}
+
+/* =============================================================
+   THE GREAT COLLAPSE — singularity event
+   ============================================================= */
+
+// HSL ↔ RGB conversion for hue rotation
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h, s, l = (max + min) / 2;
+  if (max === min) { h = s = 0; }
+  else {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case r: h = ((g - b) / d + (g < b ? 6 : 0)) / 6; break;
+      case g: h = ((b - r) / d + 2) / 6; break;
+      case b: h = ((r - g) / d + 4) / 6; break;
+    }
+  }
+  return [h, s, l];
+}
+function hslToRgb(h, s, l) {
+  let r, g, b;
+  if (s === 0) { r = g = b = l; }
+  else {
+    const hue2rgb = (p, q, t) => {
+      if (t < 0) t += 1; if (t > 1) t -= 1;
+      if (t < 1/6) return p + (q - p) * 6 * t;
+      if (t < 1/2) return q;
+      if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+      return p;
+    };
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    r = hue2rgb(p, q, h + 1/3);
+    g = hue2rgb(p, q, h);
+    b = hue2rgb(p, q, h - 1/3);
+  }
+  return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+function hexToRgbArr(hex) {
+  const v = parseInt(hex.slice(1), 16);
+  return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+}
+function rgbToHex(r, g, b) {
+  return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+}
+function lerpColor(c1, c2, t) {
+  return [
+    Math.round(c1[0] + (c2[0] - c1[0]) * t),
+    Math.round(c1[1] + (c2[1] - c1[1]) * t),
+    Math.round(c1[2] + (c2[2] - c1[2]) * t),
+  ];
+}
+
+// Background color shifts: each singularity pushes the BG through a cycle
+const BG_BASE = hexToRgbArr(BG);
+function singularityBgColor(count) {
+  if (count === 0) return BG_BASE;
+  const hueShifts = [25, 200, 270, 50, 320];
+  const idx = (count - 1) % hueShifts.length;
+  const [h, s, l] = rgbToHsl(...BG_BASE);
+  const sat = Math.min(s + 0.08 * count, 0.35);
+  const newH = (h + hueShifts[idx] / 360) % 1;
+  return hslToRgb(newH, sat, l);
+}
+
+// Detect dark star proximity — called when singPhase === null
+function checkDarkStarProximity() {
+  // Only consider non-palette dark stars well above the palette zone
+  const stars = shapes.filter(s => s.type === 'darkstar' && !s.dying && !s.swallowed && !s.isPalette && s.y < PAL_ZONE - 0.05);
+  if (stars.length < 2) return;
+  let closest = null, closestDist = Infinity;
+  for (let i = 0; i < stars.length; i++) {
+    for (let j = i + 1; j < stars.length; j++) {
+      const dx = stars[i].x - stars[j].x;
+      const dy = stars[i].y - stars[j].y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < closestDist) { closestDist = d; closest = [stars[i], stars[j]]; }
+    }
+  }
+  if (!closest) return;
+  if (closestDist < SING_WARN) {
+    singStars = closest;
+    singPhase = 'warning';
+    singTime = performance.now();
+  }
+}
+
+// Warning phase: quiver, tendril, gravitational audio
+function updateWarning(time) {
+  if (!singStars || singStars[0].dying || singStars[1].dying) {
+    cancelWarning(); return;
+  }
+  const dx = singStars[0].x - singStars[1].x;
+  const dy = singStars[0].y - singStars[1].y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  // Stars moved apart — cancel
+  if (dist > SING_WARN * 1.1) { cancelWarning(); return; }
+
+  // Proximity factor: 0 at warn radius, 1 at critical
+  const prox = clamp(1 - (dist - SING_CRIT) / (SING_WARN - SING_CRIT), 0, 1);
+
+  // Gravitational audio — create if needed
+  if (audioOK && actx && masterGain && !singHum) {
+    // Two detuned oscillators for beating interference
+    const osc1 = actx.createOscillator();
+    const osc2 = actx.createOscillator();
+    osc1.type = 'sine';
+    osc2.type = 'sine';
+    osc1.frequency.value = 38;
+    osc2.frequency.value = 40; // 2Hz beat at start
+    const beatGain = actx.createGain();
+    beatGain.gain.value = 0;
+    osc1.connect(beatGain);
+    osc2.connect(beatGain);
+    beatGain.connect(masterGain);
+    osc1.start();
+    osc2.start();
+
+    // Filtered noise — vortex whoosh
+    const nSrc = actx.createBufferSource();
+    nSrc.buffer = getNoiseBuffer();
+    nSrc.loop = true;
+    const bp = actx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 80;
+    bp.Q.value = 5;
+    const noiseGain = actx.createGain();
+    noiseGain.gain.value = 0;
+    nSrc.connect(bp);
+    bp.connect(noiseGain);
+    noiseGain.connect(masterGain);
+    nSrc.start();
+
+    singHum = { osc1, osc2, beatGain, nSrc, bp, noiseGain };
+  }
+  if (singHum) {
+    // Beating: detuning widens as proximity increases → faster pulsing
+    // At prox=0: 2Hz beat (subtle). At prox=1: 12Hz beat (urgent)
+    const beatRate = 2 + prox * 10;
+    const baseFreq = 35 + prox * 20;
+    singHum.osc1.frequency.value = baseFreq - beatRate / 2;
+    singHum.osc2.frequency.value = baseFreq + beatRate / 2;
+    singHum.beatGain.gain.value = prox * 0.2;
+
+    // Vortex: filter sweeps up, volume builds
+    singHum.bp.frequency.value = 80 + prox * prox * 1200;
+    singHum.bp.Q.value = 5 + prox * 8;
+    singHum.noiseGain.gain.value = prox * prox * 0.15;
+  }
+
+  // Quiver — add oscillation to dark star positions (visual only, applied in draw)
+  const quiver = prox * 0.004;
+  singStars.forEach(s => {
+    s._quiverX = (Math.random() - 0.5) * quiver;
+    s._quiverY = (Math.random() - 0.5) * quiver;
+  });
+
+  // Trigger collapse!
+  if (dist <= SING_CRIT) {
+    beginCollapse(time);
+  }
+}
+
+function cancelWarning() {
+  if (singHum) {
+    singHum.osc1.stop(); singHum.osc1.disconnect();
+    singHum.osc2.stop(); singHum.osc2.disconnect();
+    singHum.beatGain.disconnect();
+    singHum.nSrc.stop(); singHum.nSrc.disconnect();
+    singHum.bp.disconnect();
+    singHum.noiseGain.disconnect();
+    singHum = null;
+  }
+  if (singStars) {
+    singStars.forEach(s => { s._quiverX = 0; s._quiverY = 0; });
+  }
+  singStars = null;
+  singPhase = null;
+}
+
+// Draw warning tendril between two dark stars
+function drawWarningTendril(time) {
+  if (!singStars || singPhase !== 'warning') return;
+  const dx = singStars[0].x - singStars[1].x;
+  const dy = singStars[0].y - singStars[1].y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const prox = clamp(1 - (dist - SING_CRIT) / (SING_WARN - SING_CRIT), 0, 1);
+  if (prox < 0.01) return;
+
+  const x1 = singStars[0].x * W, y1 = singStars[0].y * H;
+  const x2 = singStars[1].x * W, y2 = singStars[1].y * H;
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+  const wobble = Math.sin(time * 0.003) * 20 * prox;
+
+  ctx.save();
+  ctx.strokeStyle = `rgba(180,140,255,${prox * 0.5})`;
+  ctx.lineWidth = 1 + prox * 2;
+  ctx.shadowColor = `rgba(180,140,255,${prox * 0.3})`;
+  ctx.shadowBlur = 10 + prox * 15;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.quadraticCurveTo(mx + wobble, my - wobble, x2, y2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// --- COLLAPSE ---
+function beginCollapse(time) {
+  singPhase = 'collapse';
+  singTime = time;
+  singCenter = {
+    x: clamp((singStars[0].x + singStars[1].x) / 2, 0.1, 0.9),
+    y: clamp((singStars[0].y + singStars[1].y) / 2, 0.1, PAL_ZONE - 0.1),
+  };
+
+  // Cancel any active drag
+  drag = null;
+  volDrag = false;
+
+  // Snapshot all shape positions (by id)
+  singSnap = {};
+  shapes.forEach(s => {
+    if (!s.isPalette) singSnap[s.id] = { x: s.x, y: s.y };
+  });
+
+  // Fade out warning audio smoothly
+  if (singHum) {
+    const now = actx.currentTime;
+    singHum.beatGain.gain.setValueAtTime(singHum.beatGain.gain.value, now);
+    singHum.beatGain.gain.linearRampToValueAtTime(0, now + 0.5);
+    singHum.noiseGain.gain.setValueAtTime(singHum.noiseGain.gain.value, now);
+    singHum.noiseGain.gain.linearRampToValueAtTime(0, now + 0.5);
+    const humRef = singHum;
+    setTimeout(() => {
+      humRef.osc1.stop(); humRef.osc1.disconnect();
+      humRef.osc2.stop(); humRef.osc2.disconnect();
+      humRef.beatGain.disconnect();
+      humRef.nSrc.stop(); humRef.nSrc.disconnect();
+      humRef.bp.disconnect();
+      humRef.noiseGain.disconnect();
+    }, 600);
+    singHum = null;
+  }
+
+  // Dramatic collapse sound: descending roar + impact thud
+  if (audioOK && actx && masterGain) {
+    const now = actx.currentTime;
+    const dur = SING_COLLAPSE_MS / 1000;
+
+    // Descending sweep: filtered noise whoosh pulling downward
+    const nSrc = actx.createBufferSource();
+    nSrc.buffer = getNoiseBuffer();
+    const bp = actx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(2000, now);
+    bp.frequency.exponentialRampToValueAtTime(40, now + dur);
+    bp.Q.value = 3;
+    const nGain = actx.createGain();
+    nGain.gain.setValueAtTime(0.15, now);
+    nGain.gain.linearRampToValueAtTime(0.35, now + dur * 0.6);
+    nGain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    nSrc.connect(bp); bp.connect(nGain); nGain.connect(masterGain);
+    nSrc.start(now); nSrc.stop(now + dur + 0.1);
+
+    // Deep descending tone — gravitational groan
+    const osc = actx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(120, now);
+    osc.frequency.exponentialRampToValueAtTime(25, now + dur);
+    const lp = actx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(300, now);
+    lp.frequency.exponentialRampToValueAtTime(60, now + dur);
+    const oGain = actx.createGain();
+    oGain.gain.setValueAtTime(0.12, now);
+    oGain.gain.linearRampToValueAtTime(0.2, now + dur * 0.5);
+    oGain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    osc.connect(lp); lp.connect(oGain); oGain.connect(masterGain);
+    osc.start(now); osc.stop(now + dur + 0.1);
+  }
+}
+
+function updateCollapse(elapsed) {
+  const t = clamp(elapsed / SING_COLLAPSE_MS, 0, 1);
+
+  // Phase A (0–40%): the two dark stars pull toward each other and merge
+  // Phase A (0–20%): dark stars rush together; Phase B (20–100%): accretion + decay
+  const MERGE_T = 0.2;
+
+  if (t < MERGE_T) {
+    // Dark stars accelerate toward each other — fast cubic ease-in
+    const mt = t / MERGE_T;
+    const mergeEase = mt * mt * mt; // cubic — slow start, fast finish
+    if (singStars) {
+      singStars.forEach((star, idx) => {
+        const snap = singSnap[star.id];
+        if (!snap) return;
+        star.x = snap.x + (singCenter.x - snap.x) * mergeEase;
+        star.y = snap.y + (singCenter.y - snap.y) * mergeEase;
+        // Shrink slightly as they converge — still visible at merge point
+        star._collapseScale = Math.max(0.4, 1 - mergeEase * 0.6);
+        star.vx = 0; star.vy = 0;
+      });
+    }
+    // Other shapes stay put but start trembling
+    const tremble = mt * mt * 0.003;
+    shapes.forEach(s => {
+      if (s.isPalette || (singStars && singStars.includes(s))) return;
+      const snap = singSnap[s.id];
+      if (!snap) return;
+      s.x = snap.x + (Math.random() - 0.5) * tremble;
+      s.y = snap.y + (Math.random() - 0.5) * tremble;
+    });
+  } else {
+    // Phase B: singularity formed — accretion disk then orbital decay
+    const bt = (t - MERGE_T) / (1 - MERGE_T); // 0→1 within phase B
+
+    // Sub-phases: orbit acceleration (0–0.70), then orbital decay (0.70–1)
+    const ORBIT_END = 0.70;
+
+    shapes.forEach(s => {
+      if (s.isPalette) return;
+      const snap = singSnap[s.id];
+      if (!snap) return;
+
+      // Merged dark star — visible during orbit, shrinks during decay
+      if (singStars && singStars.includes(s)) {
+        s.x = singCenter.x;
+        s.y = singCenter.y;
+        if (bt < ORBIT_END) {
+          // Hold at 0.4 scale through the orbit phase — visible singularity core
+          s._collapseScale = 0.4;
+        } else {
+          // Shrink to point during decay
+          const decayProg = (bt - ORBIT_END) / (1 - ORBIT_END);
+          s._collapseScale = Math.max(0.01, 0.4 * (1 - decayProg * decayProg));
+        }
+        return;
+      }
+
+      const baseDist = Math.sqrt(
+        Math.pow(snap.x - singCenter.x, 2) + Math.pow(snap.y - singCenter.y, 2)
+      );
+      const baseAngle = Math.atan2(snap.y - singCenter.y, snap.x - singCenter.x);
+      const dir = s.id % 2 ? 1 : -1;
+      const orbitSpeed = 1.8 + (s.id % 5) * 0.7; // radians per normalized time
+
+      let curDist, angle;
+
+      if (bt < ORBIT_END) {
+        // Orbit acceleration: radius holds mostly steady, angular velocity ramps slow→fast
+        const ot = bt / ORBIT_END; // 0→1 within orbit phase
+        // Slight inward drift (down to 85% of original radius)
+        curDist = baseDist * (1 - ot * 0.15);
+        // Cubic ramp — starts very slow, accelerates dramatically toward end
+        const angularProgress = ot * ot * ot;
+        angle = baseAngle + angularProgress * orbitSpeed * 2.2 * dir;
+      } else {
+        // Orbital decay: radius collapses, angular velocity ∝ 1/r²
+        const dt2 = (bt - ORBIT_END) / (1 - ORBIT_END); // 0→1 within decay
+        const decayEase = dt2 * dt2 * dt2; // cubic ease-in — slow start, fast finish
+        // Radius shrinks from 85% down to ~0
+        const startR = baseDist * 0.85;
+        curDist = startR * Math.max(0.01, 1 - decayEase);
+        // Continue from orbit-end speed and accelerate with shrinking radius
+        const orbitEndAngle = baseAngle + 1.0 * orbitSpeed * 2.2 * dir;
+        const rRatio = startR / Math.max(curDist, 0.001);
+        // Integrate angular displacement — use smooth approximation
+        const decayRotation = orbitSpeed * 3 * dir * (dt2 + dt2 * dt2 + dt2 * dt2 * dt2) / 3;
+        angle = orbitEndAngle + decayRotation * Math.min(rRatio, 8);
+      }
+
+      s.x = singCenter.x + Math.cos(angle) * curDist;
+      s.y = singCenter.y + Math.sin(angle) * curDist;
+      s.vx = 0; s.vy = 0;
+
+      // Scale: stays ~1 during orbit, shrinks during decay
+      const overallEase = bt * bt * bt;
+      s._collapseScale = bt < ORBIT_END ? (1 - bt * 0.1) : Math.max(0.05, 1 - overallEase * 0.9);
+    });
+
+    // Fade audio — hold full during orbit phase, fade during decay
+    const decayT = bt < ORBIT_END ? 0 : (bt - ORBIT_END) / (1 - ORBIT_END);
+    const audioFade = 1 - decayT * decayT;
+    shapes.forEach(s => {
+      if (s.isPalette || !s.synth) return;
+      s.synth.setVol(Math.max(shapeVolume(s) * audioFade, 0.001));
+    });
+  }
+
+  // Collapse complete → void
+  if (t >= 1) {
+    beginVoid(performance.now());
+  }
+}
+
+// --- VOID ---
+function beginVoid(time) {
+  singPhase = 'void';
+  singTime = time;
+  singPulse = 0;
+
+  // Detach all synths (they're at ~zero volume already)
+  shapes.forEach(s => { if (!s.isPalette) detachSynth(s); });
+
+  // Consume swallowed shapes FIRST (before removing dark stars)
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    if (shapes[i].swallowed) {
+      detachSynth(shapes[i]);
+      shapes.splice(i, 1);
+    }
+  }
+
+  // Remove ALL dark stars (not just the triggering pair — they all collapse)
+  for (let i = shapes.length - 1; i >= 0; i--) {
+    if (shapes[i].type === 'darkstar' && !shapes[i].isPalette) {
+      detachSynth(shapes[i]);
+      shapes.splice(i, 1);
+    }
+  }
+
+  // All surviving non-palette shapes are now invisible at center
+  shapes.forEach(s => {
+    if (!s.isPalette) {
+      s.x = singCenter.x;
+      s.y = singCenter.y;
+      s.opacity = 0;
+      s._collapseScale = 0.01;
+    }
+  });
+
+  // Play sub-bass rumble
+  if (audioOK && actx && masterGain) {
+    const now = actx.currentTime;
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(28, now);
+    osc.frequency.linearRampToValueAtTime(22, now + 1.5);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(0.3, now + 0.3);
+    g.gain.linearRampToValueAtTime(0, now + 1.4);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(now); osc.stop(now + 1.5);
+  }
+}
+
+function updateVoid(elapsed) {
+  const t = clamp(elapsed / SING_VOID_MS, 0, 1);
+
+  // Bright pulse at midpoint
+  if (t > 0.3 && t < 0.7) {
+    singPulse = 1 - Math.abs(t - 0.5) / 0.2;
+  } else {
+    singPulse = 0;
+  }
+
+  // Void complete → apply transformation and begin expansion
+  if (t >= 1) {
+    applyTransformation();
+    beginExpansion(performance.now());
+  }
+}
+
+// --- TRANSFORMATION (instant, at end of void) ---
+function applyTransformation() {
+  singCount++;
+
+  // Hue-rotate surviving shapes by 180°
+  shapes.forEach(s => {
+    if (s.isPalette || s.type === 'darkstar') return;
+    const [h, sat, l] = rgbToHsl(...s.rgb);
+    s.rgb = hslToRgb((h + 0.5) % 1, sat, l);
+    s._dirty = true;
+  });
+
+  // Also hue-rotate palette tray shapes so new shapes match the transformed universe
+  palette.forEach(s => {
+    if (s.type === 'darkstar') return;
+    const [h, sat, l] = rgbToHsl(...s.rgb);
+    s.rgb = hslToRgb((h + 0.5) % 1, sat, l);
+    s._dirty = true;
+  });
+
+  // Pick a new constellation (different from current if possible)
+  let newIdx;
+  do { newIdx = Math.floor(Math.random() * CONSTELLATIONS.length); }
+  while (newIdx === singConstIdx && CONSTELLATIONS.length > 1);
+  singConstIdx = newIdx;
+
+  // Background color shift
+  singBgFrom = singCount > 1 ? singularityBgColor(singCount - 1) : BG_BASE;
+  singBgTo = singularityBgColor(singCount);
+
+  // Add scar
+  singScars.push({ x: singCenter.x, y: singCenter.y, birth: performance.now() });
+
+  // Rotate sound palette — new synths will build with the next palette
+  // Old synths are already detached (void phase), so no teardown needed
+  soundPalette = (soundPalette + 1) % PALETTE_NAMES.length;
+  // Rebuild table surface to update compass label
+  buildTable();
+}
+
+// --- EXPANSION ---
+function beginExpansion(time) {
+  singPhase = 'expand';
+  singTime = time;
+
+  // Calculate target positions from new constellation
+  const { pts: pattern, lines: connections } = CONSTELLATIONS[singConstIdx];
+  const angle = Math.random() * Math.PI * 2;
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  const rotated = pattern.map(([px, py]) => {
+    const cx = px - 0.5, cy = py - 0.5;
+    return [cx * cos - cy * sin, cx * sin + cy * cos];
+  });
+  const rxs = rotated.map(p => p[0]), rys = rotated.map(p => p[1]);
+  const rxMin = Math.min(...rxs), rxMax = Math.max(...rxs);
+  const ryMin = Math.min(...rys), ryMax = Math.max(...rys);
+  const rxRange = rxMax - rxMin || 1, ryRange = ryMax - ryMin || 1;
+  const xPad = 0.15, yPad = 0.12;
+  const xSpan = 1 - 2 * xPad, ySpan = PAL_ZONE - 2 * yPad;
+  const scale = Math.min(xSpan / rxRange, ySpan / ryRange);
+  const placed = rotated.map(([rx, ry]) => [
+    xPad + (rx - rxMin) * scale + (xSpan - rxRange * scale) / 2,
+    yPad + (ry - ryMin) * scale + (ySpan - ryRange * scale) / 2,
+  ]);
+
+  // Match survivors to constellation positions (dark stars already removed in void)
+  let survivors = shapes.filter(s => !s.isPalette && s.type !== 'darkstar');
+  singTargets = {};
+
+  // If more survivors than constellation slots, remove excess
+  while (survivors.length > placed.length) {
+    const excess = survivors.pop();
+    detachSynth(excess);
+    const idx = shapes.indexOf(excess);
+    if (idx >= 0) shapes.splice(idx, 1);
+  }
+
+  // Assign positions: survivors get first N slots, create new shapes for remaining
+  const tonal = ['circle', 'triangle', 'pentagon'];
+  const rhythm = ['square', 'hexagon'];
+  const spawnable = [...tonal, ...rhythm];
+
+  for (let i = 0; i < placed.length; i++) {
+    if (i < survivors.length) {
+      singTargets[survivors[i].id] = { x: placed[i][0], y: placed[i][1] };
+    } else {
+      // Create new shape to fill constellation
+      const type = spawnable[Math.floor(Math.random() * spawnable.length)];
+      const ns = makeShape(type, singCenter.x, singCenter.y, false);
+      ns.opacity = 0;
+      ns._collapseScale = 0.01;
+      ns.volAngle = (Math.random() - 0.5) * 2 * Math.PI;
+      if (driftActive) {
+        ns.driftAngle = Math.random() * Math.PI * 2;
+        ns.driftSpeed = 0.00025 + Math.random() * 0.00025;
+        ns.driftOmega = (Math.random() - 0.5) * 0.0015;
+      }
+      // Hue-rotate new shape to match transformed universe
+      const [h, sat, l] = rgbToHsl(...ns.rgb);
+      ns.rgb = hslToRgb((h + 0.5 * singCount) % 1, sat, l);
+      ns._dirty = true;
+      shapes.push(ns);
+      singTargets[ns.id] = { x: placed[i][0], y: placed[i][1] };
+    }
+  }
+
+  // Build constellation guide for the new pattern
+  const guideLines = connections.map(([a, b]) => [
+    placed[a][0], placed[a][1], placed[b][0], placed[b][1],
+  ]);
+  constellationGuide = { lines: guideLines, startTime: null, duration: 5000 };
+
+  // Play expansion sound: bright rising tone
+  if (audioOK && actx && masterGain) {
+    const now = actx.currentTime;
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(80, now);
+    osc.frequency.exponentialRampToValueAtTime(440, now + 1.2);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(0.2, now + 0.3);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 2);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(now); osc.stop(now + 2.1);
+    // Soft shimmer overtone
+    const osc2 = actx.createOscillator();
+    osc2.type = 'triangle';
+    osc2.frequency.setValueAtTime(160, now);
+    osc2.frequency.exponentialRampToValueAtTime(880, now + 1.5);
+    const g2 = actx.createGain();
+    g2.gain.setValueAtTime(0, now + 0.2);
+    g2.gain.linearRampToValueAtTime(0.08, now + 0.6);
+    g2.gain.exponentialRampToValueAtTime(0.001, now + 2);
+    osc2.connect(g2); g2.connect(masterGain);
+    osc2.start(now); osc2.stop(now + 2.2);
+  }
+}
+
+function updateExpand(elapsed) {
+  const t = clamp(elapsed / SING_EXPAND_MS, 0, 1);
+  const ease = 1 - Math.pow(1 - t, 3); // cubic ease-out — explosive then decelerating
+
+  shapes.forEach(s => {
+    if (s.isPalette) return;
+    const target = singTargets[s.id];
+    if (!target) return;
+
+    // Lerp from center to target
+    s.x = singCenter.x + (target.x - singCenter.x) * ease;
+    s.y = singCenter.y + (target.y - singCenter.y) * ease;
+
+    // Scale up
+    s._collapseScale = ease;
+
+    // Fade in
+    s.opacity = clamp(ease * 1.5, 0, 1);
+    s.fadeTarget = 1;
+  });
+
+  // Attach synths late in expansion, fade in very gently
+  if (t > 0.5 && masterGain && actx && actx.state === 'running') {
+    shapes.forEach(s => {
+      if (!s.isPalette && !s.synth && !s.dying) {
+        attachSynth(s);
+        if (s.synth) {
+          s.synth.setVol(0.001);
+          // Pause swell immediately — we control volume during expansion/settle
+          if (s.synth.swell) s.synth.swell.pause();
+        }
+      }
+    });
+    // Gentle fade: quadratic ease-in from 50% to 100% of expansion
+    const audioT = clamp((t - 0.5) / 0.5, 0, 1);
+    const fadeVol = audioT * audioT * 0.5; // max 50% during expansion; settle brings to full
+    shapes.forEach(s => {
+      if (!s.isPalette && s.synth) {
+        s.synth.setVol(shapeVolume(s) * fadeVol);
+      }
+    });
+  }
+
+  if (t >= 1) {
+    beginSettle(performance.now());
+  }
+}
+
+// --- SETTLING ---
+function beginSettle(time) {
+  singPhase = 'settle';
+  singTime = time;
+
+  // Commit final positions and clear cinematic state
+  shapes.forEach(s => {
+    if (s.isPalette) return;
+    const target = singTargets[s.id];
+    if (target) { s.x = target.x; s.y = target.y; }
+    s._collapseScale = undefined;
+    s._quiverX = 0; s._quiverY = 0;
+    s.opacity = 1;
+    s.fadeTarget = 1;
+    // Give shapes gentle drift if active
+    if (driftActive) {
+      s.driftAngle = Math.random() * Math.PI * 2;
+      s.driftSpeed = 0.00025 + Math.random() * 0.00025;
+      s.driftOmega = (Math.random() - 0.5) * 0.0015;
+    }
+  });
+
+  // Activate constellation guide timer
+  if (constellationGuide) constellationGuide.startTime = performance.now();
+  proxFadeStart = 0;
+
+  // Compute proximity for visual lines, but override audio to match expansion end (50%)
+  recomputeProximity();
+  shapes.forEach(s => {
+    if (!s.isPalette && s.synth) {
+      const base = shapeVolume(s);
+      const boost = Math.min(s.proxBoost || 0, 0.3);
+      s.synth.setVol((base + boost) * 0.5);
+    }
+  });
+}
+
+function updateSettle(elapsed) {
+  // Gently ramp audio from 50% to 100% during settle (including proximity boost)
+  const t = clamp(elapsed / SING_SETTLE_MS, 0, 1);
+  const vol = 0.5 + t * 0.5;
+  shapes.forEach(s => {
+    if (!s.isPalette && s.synth) {
+      const base = shapeVolume(s);
+      const boost = Math.min(s.proxBoost || 0, 0.3);
+      s.synth.setVol((base + boost) * vol);
+    }
+  });
+
+  if (t >= 1) {
+    // Singularity complete — resume normal
+    singPhase = null;
+    singStars = null;
+    singSnap = {};
+    singTargets = {};
+    singBgFrom = null;
+    singBgTo = null;
+
+    // Final full volume — include proximity boost for seamless handoff
+    shapes.forEach(s => {
+      if (!s.isPalette && s.synth) {
+        const base = shapeVolume(s);
+        const boost = Math.min(s.proxBoost || 0, 0.3);
+        s.synth.setVol(base + boost);
+        // Resume swell from paused hold-phase — first tick will be at peak
+        if (s.synth.swell) s.synth.swell.resume();
+      }
+    });
+
+    // Rebuild table surface with new background
+    buildTable();
+  }
+}
+
+// Master singularity update — called from draw loop
+function updateSingularity(time) {
+  if (singPhase === null) {
+    checkDarkStarProximity();
+    return;
+  }
+  const elapsed = time - singTime;
+  switch (singPhase) {
+    case 'warning': updateWarning(time); break;
+    case 'collapse': updateCollapse(elapsed); break;
+    case 'void':     updateVoid(elapsed); break;
+    case 'expand':   updateExpand(elapsed); break;
+    case 'settle':   updateSettle(elapsed); break;
+  }
+}
+
+// Draw singularity visual effects (void pulse, ripple ring, scars)
+function drawSingularityFx(time) {
+  // Bright pulse during void
+  if (singPhase === 'void' && singPulse > 0 && singCenter) {
+    const r = singPulse * 60;
+    const grad = ctx.createRadialGradient(
+      singCenter.x * W, singCenter.y * H, 0,
+      singCenter.x * W, singCenter.y * H, r
+    );
+    grad.addColorStop(0, `rgba(255,255,255,${singPulse * 0.9})`);
+    grad.addColorStop(0.4, `rgba(200,180,255,${singPulse * 0.4})`);
+    grad.addColorStop(1, `rgba(180,140,255,0)`);
+    ctx.save();
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(singCenter.x * W, singCenter.y * H, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Ripple rings from scars (expanding for 12s, then faint permanent mark)
+  const now = time;
+  singScars.forEach(scar => {
+    const age = now - scar.birth;
+    const sx = scar.x * W, sy = scar.y * H;
+    const maxR = Math.max(W, H) * 0.5;
+    if (age < 12000) {
+      // 3 staggered wavy rings, each offset in time
+      for (let ring = 0; ring < 3; ring++) {
+        const ringAge = age - ring * 1500; // stagger by 1.5s
+        if (ringAge < 0 || ringAge > 10000) continue;
+        const ringT = ringAge / 10000;
+        const ringR = ringT * maxR;
+        const alpha = 0.25 * (1 - ringT) * (1 - ring * 0.25);
+        if (ringR < 2 || alpha < 0.005) continue;
+
+        // Draw wavy circle using line segments with noise
+        const segments = Math.max(24, Math.floor(ringR * 0.3));
+        const seed = scar.birth + ring * 7777;
+        ctx.save();
+        ctx.strokeStyle = `rgba(180,140,255,${alpha})`;
+        ctx.lineWidth = 1.2 - ring * 0.3;
+        ctx.beginPath();
+        for (let i = 0; i <= segments; i++) {
+          const a = (i / segments) * Math.PI * 2;
+          // Deterministic wobble per segment
+          const wobble = Math.sin(a * 7 + seed * 0.001) * 3
+                       + Math.sin(a * 13 + seed * 0.003) * 2;
+          const r = ringR + wobble * (1 + ringT);
+          const px = sx + Math.cos(a) * r;
+          const py = sy + Math.sin(a) * r;
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+    // Permanent faint scar — also hand-drawn
+    const scarWobble = 6;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(180,140,255,0.04)';
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    for (let i = 0; i <= 16; i++) {
+      const a = (i / 16) * Math.PI * 2;
+      const w = Math.sin(a * 5 + scar.birth * 0.001) * scarWobble;
+      const px = sx + Math.cos(a) * (4 + w);
+      const py = sy + Math.sin(a) * (4 + w);
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.restore();
+  });
+}
+
+// Compute current background color (used by draw loop)
+function currentBgColor() {
+  if (singPhase === 'void') {
+    return [0, 0, 0]; // fully black during void
+  }
+  if (singPhase === 'collapse') {
+    // BG stays normal during merge + orbit, fades to black during orbital decay
+    const t = clamp((performance.now() - singTime) / SING_COLLAPSE_MS, 0, 1);
+    const base = singCount > 0 ? singularityBgColor(singCount) : BG_BASE;
+    const MERGE_T = 0.2, ORBIT_END_T = 0.2 + 0.8 * 0.70; // match Phase A + orbit portion of B
+    const darkT = clamp((t - ORBIT_END_T) / (1 - ORBIT_END_T), 0, 1); // 0 during orbit, 0→1 during decay
+    return lerpColor(base, [0, 0, 0], darkT);
+  }
+  if (singPhase === 'expand' && singBgTo) {
+    // Transition from black → new BG during expansion
+    const t = clamp((performance.now() - singTime) / SING_EXPAND_MS, 0, 1);
+    const ease = 1 - Math.pow(1 - t, 2);
+    return lerpColor([0, 0, 0], singBgTo, ease);
+  }
+  if (singPhase === 'settle' && singBgTo) {
+    return singBgTo;
+  }
+  // Normal: use accumulated BG color
+  if (singCount > 0) return singularityBgColor(singCount);
+  return BG_BASE;
+}
+
+/* =============================================================
+   DARK STAR AUTO-SPAWN — seeds the next singularity cycle
+   ============================================================= */
+
+function updateDarkStarSpawn(time) {
+  // Don't spawn during singularity or if dark stars already exist
+  if (singPhase) { darkStarSpawnTimer = 0; return; }
+  const existingStars = shapes.filter(s => s.type === 'darkstar' && !s.dying && !s.isPalette);
+  if (existingStars.length >= 2) { darkStarSpawnTimer = 0; return; }
+
+  // Start countdown if not active
+  if (!darkStarSpawnTimer) {
+    darkStarSpawnTimer = time;
+    return;
+  }
+
+  // Wait for delay; allow spawning after a singularity OR when drift is active
+  if (singCount === 0 && !driftActive) return;
+  const elapsed = time - darkStarSpawnTimer;
+  const needed = 2 - existingStars.length;
+
+  if (elapsed > DARKSTAR_SPAWN_DELAY && needed > 0) {
+    // Spawn dark stars staggered — one now, second after an interval
+    const alreadySpawning = materializingStars.length;
+    const totalPresent = existingStars.length + alreadySpawning;
+    if (totalPresent < 1) {
+      // Spawn first star
+      spawnDarkStar(time);
+    } else if (totalPresent < 2 && elapsed > DARKSTAR_SPAWN_DELAY + 5000) {
+      // Spawn second star 5s after the first
+      spawnDarkStar(time);
+      darkStarSpawnTimer = 0;
+    }
+  }
+}
+
+function spawnDarkStar(time) {
+  // Pick a random position well inside the playable area
+  const x = 0.15 + Math.random() * 0.7;
+  const y = 0.12 + Math.random() * (PAL_ZONE - 0.30);
+
+  const star = makeShape('darkstar', x, y, false);
+  star.opacity = 0;
+  star._materializeStart = time;
+  star._collapseScale = 0.01; // start as a point
+  if (driftActive) {
+    star.driftAngle = Math.random() * Math.PI * 2;
+    star.driftSpeed = 0.00025 + Math.random() * 0.00025;
+    star.driftOmega = (Math.random() - 0.5) * 0.0015;
+  }
+  shapes.push(star);
+  materializingStars.push({ shape: star, startTime: time });
+
+  // Materialization sound: deep resonant tone, like darkness condensing
+  if (audioOK && actx && masterGain) {
+    const now = actx.currentTime;
+    const dur = DARKSTAR_MATERIALIZE_MS / 1000;
+    // Low tone rising from sub-bass
+    const osc = actx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(20, now);
+    osc.frequency.exponentialRampToValueAtTime(55, now + dur);
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(0.15, now + dur * 0.6);
+    g.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    osc.connect(g); g.connect(masterGain);
+    osc.start(now); osc.stop(now + dur + 0.1);
+
+    // Reverse shimmer — filtered noise fading IN (opposite of swallow sound)
+    const nSrc = actx.createBufferSource();
+    nSrc.buffer = getNoiseBuffer();
+    const bp = actx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(60, now);
+    bp.frequency.exponentialRampToValueAtTime(800, now + dur * 0.7);
+    bp.frequency.exponentialRampToValueAtTime(60, now + dur);
+    bp.Q.value = 6;
+    const ng = actx.createGain();
+    ng.gain.setValueAtTime(0, now);
+    ng.gain.linearRampToValueAtTime(0.08, now + dur * 0.4);
+    ng.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    nSrc.connect(bp); bp.connect(ng); ng.connect(masterGain);
+    nSrc.start(now); nSrc.stop(now + dur + 0.1);
+  }
+}
+
+function updateMaterializing(time) {
+  for (let i = materializingStars.length - 1; i >= 0; i--) {
+    const { shape, startTime } = materializingStars[i];
+    const elapsed = time - startTime;
+    const t = clamp(elapsed / DARKSTAR_MATERIALIZE_MS, 0, 1);
+
+    // Ease-out: quick emergence then settles
+    const ease = 1 - Math.pow(1 - t, 3);
+
+    shape.opacity = ease;
+    shape.fadeTarget = 1;
+    shape._collapseScale = ease;
+
+    if (t >= 1) {
+      shape._collapseScale = undefined;
+      shape._materializeStart = undefined;
+      shape.opacity = 1;
+      materializingStars.splice(i, 1);
+    }
+  }
+}
+
+// Draw materialization effect: inward-pulling darkness at spawn point
+function drawMaterializeFx(time) {
+  materializingStars.forEach(({ shape, startTime }) => {
+    const elapsed = time - startTime;
+    const t = clamp(elapsed / DARKSTAR_MATERIALIZE_MS, 0, 1);
+    if (t >= 1) return;
+
+    const sx = shape.x * W, sy = shape.y * H;
+    const invT = 1 - t; // fades as star solidifies
+
+    // Dark vortex: radial streaks pulling inward
+    const streaks = 8;
+    ctx.save();
+    for (let s = 0; s < streaks; s++) {
+      const angle = (s / streaks) * Math.PI * 2 + time * 0.002;
+      const outerR = (30 + invT * 60) * (1 + Math.sin(s * 3.7) * 0.3);
+      const innerR = 4 + t * 8;
+
+      const x1 = sx + Math.cos(angle) * outerR;
+      const y1 = sy + Math.sin(angle) * outerR;
+      const x2 = sx + Math.cos(angle) * innerR;
+      const y2 = sy + Math.sin(angle) * innerR;
+
+      ctx.strokeStyle = `rgba(20,10,30,${invT * 0.4})`;
+      ctx.lineWidth = 1 + invT;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    // Dark halo that contracts
+    const haloR = 20 + invT * 50;
+    const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, haloR);
+    grad.addColorStop(0, `rgba(5,3,2,${invT * 0.5})`);
+    grad.addColorStop(0.5, `rgba(10,5,15,${invT * 0.2})`);
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(sx, sy, haloR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
   });
 }
 
@@ -1912,9 +2957,18 @@ function drawShape(shape, time) {
   // Glow when proximate
   const glow = Math.min((shape.proxBoost || 0) / 4, 0.5);
 
+  // Singularity: collapse/expand scale override
+  if (shape._collapseScale !== undefined) {
+    sc *= clamp(shape._collapseScale, 0.01, 2);
+  }
+
+  // Singularity: quiver offset for dark stars during warning
+  const qx = (shape._quiverX || 0) * W;
+  const qy = (shape._quiverY || 0) * H;
+
   ctx.save();
   ctx.globalAlpha = clamp(shape.opacity + extraAlpha, 0, 1);
-  ctx.translate(shape.x * W, shape.y * H);
+  ctx.translate(shape.x * W + qx, shape.y * H + qy);
   ctx.rotate(rot + (shape.volAngle || 0));
   ctx.scale(sc, sc);
 
@@ -2183,6 +3237,10 @@ function onDown(e) {
   // preventDefault as breaking the gesture chain for audio unlock.
   if (!audioOK) initAudio();
 
+  // Lock interaction during cinematic singularity phases
+  const singLock = singPhase && singPhase !== 'warning' && singPhase !== 'settle';
+  if (singLock) { e.preventDefault(); return; }
+
   e.preventDefault();
   if (e.pointerId != null) cvs.setPointerCapture(e.pointerId);
 
@@ -2232,6 +3290,9 @@ function onDown(e) {
   if (hit.from === 'palette') {
     const tmpl = hit.shape;
     const ns = makeShape(tmpl.type, tmpl.x, tmpl.y, false);
+    // Copy palette template's current color (may be hue-rotated post-singularity)
+    ns.rgb = [tmpl.rgb[0], tmpl.rgb[1], tmpl.rgb[2]];
+    ns._dirty = true;
     shapes.push(ns);
     if (masterGain) attachSynth(ns);
     if (driftActive) {
@@ -2345,6 +3406,7 @@ cvs.addEventListener('touchstart', (e) => {
 
 // Mouse wheel → per-shape volume knob (hover over shape and scroll)
 cvs.addEventListener('wheel', (e) => {
+  if (singPhase && singPhase !== 'warning' && singPhase !== 'settle') return;
   const hit = hitTest(e.clientX, e.clientY);
   if (hit && hit.from === 'shape') {
     e.preventDefault();
@@ -2375,58 +3437,71 @@ function draw(time) {
   const dt = Math.min((time - lastTime) / 1000, 0.05); // seconds, capped at 50ms
   lastTime = time;
 
-  // Late-attach synths — only when context is running
-  if (masterGain && actx && actx.state === 'running') {
-    shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying && !s.swallowed) attachSynth(s); });
+  const singActive = singPhase && singPhase !== 'warning';
+
+  // --- SINGULARITY UPDATE (runs every frame) ---
+  updateSingularity(time);
+
+  // --- DARK STAR AUTO-SPAWN (seeds next singularity cycle) ---
+  updateDarkStarSpawn(time);
+  updateMaterializing(time);
+
+  // --- NORMAL WORLD UPDATE (suppressed during cinematic singularity phases) ---
+  if (!singActive) {
+    // Late-attach synths — only when context is running
+    if (masterGain && actx && actx.state === 'running') {
+      shapes.forEach(s => { if (!s.synth && !s.isPalette && !s.dying && !s.swallowed) attachSynth(s); });
+    }
+
+    // Tick swell envelopes — JS drives the envelope gain each frame
+    // Skip during settle — updateSettle controls volume ramp
+    if (singPhase !== 'settle') {
+      shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.tick(); });
+    }
+
+    // Dark star gravity — oscillates between attractive and repulsive
+    updateGravity(dt, time);
+
+    // Throw momentum + gravity integration
+    updateMomentum(dt);
+
+    // Drift — planetary motion
+    updateDrift();
+
+    // Swallow detection
+    updateSwallows();
+
+    // Fade transitions
+    shapes.forEach(s => {
+      if (s.dying) {
+        s.opacity = Math.max(0, s.opacity - 0.025);
+      } else if (s.swallowed) {
+        if (performance.now() - s.swallowTime >= SWALLOW_FADE_MS) s.opacity = 0;
+      } else if (s.opacity < s.fadeTarget) {
+        s.opacity = Math.min(s.fadeTarget, s.opacity + 0.02);
+      }
+    });
+    // Remove fully faded shapes
+    for (let i = shapes.length - 1; i >= 0; i--) {
+      if (shapes[i].dying && shapes[i].opacity <= 0) {
+        shapes.splice(i, 1);
+      }
+    }
   }
 
-  // Tick swell envelopes — JS drives the envelope gain each frame
-  shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.tick(); });
-
-  // Dark star gravity — oscillates between attractive and repulsive
-  updateGravity(dt, time);
-
-  // Throw momentum + gravity integration
-  updateMomentum(dt);
-
-  // Drift — planetary motion
-  updateDrift();
-
-  // Swallow detection
-  updateSwallows();
-
-  // Fade transitions
-  shapes.forEach(s => {
-    if (s.dying) {
-      s.opacity = Math.max(0, s.opacity - 0.025);
-    } else if (s.swallowed) {
-      // drawShape handles ingestion alpha from elapsed time;
-      // once fully inside, zero opacity so disgorge fades back in naturally
-      if (performance.now() - s.swallowTime >= SWALLOW_FADE_MS) s.opacity = 0;
-    } else if (s.opacity < s.fadeTarget) {
-      s.opacity = Math.min(s.fadeTarget, s.opacity + 0.02);
-    }
-  });
-  // Remove fully faded shapes
-  for (let i = shapes.length - 1; i >= 0; i--) {
-    if (shapes[i].dying && shapes[i].opacity <= 0) {
-      shapes.splice(i, 1);
-    }
-  }
-
-  // Background
-  ctx.fillStyle = BG;
+  // --- BACKGROUND ---
+  const bgC = currentBgColor();
+  ctx.fillStyle = `rgb(${bgC[0]},${bgC[1]},${bgC[2]})`;
   ctx.fillRect(0, 0, W, H);
 
-  // Static table surface
-  if (tableCvs) ctx.drawImage(tableCvs, 0, 0);
+  // Static table surface (suppress during void for full blackout)
+  if (singPhase !== 'void' && tableCvs) ctx.drawImage(tableCvs, 0, 0);
 
-  // Dust motes (behind shapes)
-  updateAndDrawMotes(time);
+  // Dust motes (behind shapes) — suppress during void
+  if (singPhase !== 'void') updateAndDrawMotes(time);
 
   // Constellation guide lines — hold until audio starts, then fade out
   if (constellationGuide) {
-    // Don't start the fade timer until music is playing
     if (!constellationGuide.startTime) {
       if (audioOK) {
         constellationGuide.startTime = time;
@@ -2435,7 +3510,6 @@ function draw(time) {
     const elapsed = constellationGuide.startTime ? time - constellationGuide.startTime : 0;
     const dur = constellationGuide.duration;
     if (elapsed < dur) {
-      // Fade: full for first 2s, then linear fade out
       const holdTime = 2000;
       const alpha = elapsed < holdTime ? 0.35
         : 0.35 * (1 - (elapsed - holdTime) / (dur - holdTime));
@@ -2452,12 +3526,15 @@ function draw(time) {
       ctx.restore();
     } else if (constellationGuide.startTime) {
       constellationGuide = null;
-      proxFadeStart = time; // begin connection line fade-in
+      proxFadeStart = time;
     }
   }
 
-  // Proximity lines — suppress during constellation guide, fade in after
-  if (!constellationGuide) {
+  // Warning tendril between dark stars
+  drawWarningTendril(time);
+
+  // Proximity lines — suppress during constellation guide and cinematic phases
+  if (!constellationGuide && !singActive) {
     const PROX_FADE_DUR = 2000;
     const proxAlpha = proxFadeStart ? Math.min((time - proxFadeStart) / PROX_FADE_DUR, 1) : 1;
     if (proxAlpha > 0.01) {
@@ -2468,16 +3545,27 @@ function draw(time) {
     }
   }
 
-  // Shapes — z-sort by y (lower y = further back = drawn first)
-  const sorted = [...shapes].sort((a, b) => a.y - b.y);
-  sorted.forEach(s => drawShape(s, time));
+  // Shapes — z-sort by y (suppress during void)
+  if (singPhase !== 'void') {
+    // Dark star materialization effect (drawn behind shapes)
+    drawMaterializeFx(time);
+    const sorted = [...shapes].sort((a, b) => a.y - b.y);
+    sorted.forEach(s => drawShape(s, time));
+  }
 
-  // Palette shapes
-  palette.forEach(s => drawShape(s, time));
+  // Singularity visual effects (pulse, ripple, scars)
+  drawSingularityFx(time);
 
-  // Volume slider + drift button
-  drawVolumeSlider();
-  drawDriftBtn(time);
+  // Palette shapes (suppress during cinematic phases except settle)
+  if (!singActive || singPhase === 'settle') {
+    palette.forEach(s => drawShape(s, time));
+  }
+
+  // Volume slider + drift button (suppress during cinematic)
+  if (!singActive || singPhase === 'settle') {
+    drawVolumeSlider();
+    drawDriftBtn(time);
+  }
 
   // Grain overlay
   if (grainCvs) {
