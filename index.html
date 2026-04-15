@@ -53,7 +53,7 @@ const GRAV_SOFTEN = 0.08;    // softening radius — prevents singularity when s
 // Singularity — The Great Collapse
 const SING_CRIT    = 0.12;   // normalized distance: dark stars merge
 const SING_WARN    = 0.36;   // 3× critical — warning begins
-const SING_COLLAPSE_MS = 5000;
+const SING_COLLAPSE_MS = 4200;
 const SING_VOID_MS     = 1500;
 const SING_EXPAND_MS   = 2500;
 const SING_SETTLE_MS   = 1500;
@@ -84,6 +84,7 @@ let driftActive = false;
 let lastTime = 0;
 let motes    = [];   // floating dust particles
 let soundPalette = Math.floor(Math.random() * 3); // randomize on each load
+let paletteBlend = null; // null = pure palette, or { from: idx, to: idx, ratio: 0-1 } where ratio is weight of 'to'
 
 // Singularity state
 let singPhase  = null;  // null | 'warning' | 'collapse' | 'void' | 'expand' | 'settle'
@@ -1206,6 +1207,33 @@ function resumeAllSwells() {
   shapes.forEach(s => { if (s.synth && s.synth.swell) s.synth.swell.resume(); });
 }
 
+// Blend wrapper: runs two synths and distributes volume by ratio
+function buildBlendSynth(buildA, buildB, ratio, arg) {
+  const synthA = buildA(arg);
+  const synthB = buildB(arg);
+  const wA = 1 - ratio, wB = ratio;
+
+  return {
+    swell: {
+      tick()   { if (synthA.swell) synthA.swell.tick(); if (synthB.swell) synthB.swell.tick(); },
+      pause()  { if (synthA.swell) synthA.swell.pause(); if (synthB.swell) synthB.swell.pause(); },
+      resume() { if (synthA.swell) synthA.swell.resume(); if (synthB.swell) synthB.swell.resume(); },
+      stop()   { if (synthA.swell) synthA.swell.stop(); if (synthB.swell) synthB.swell.stop(); },
+      getValue() { return synthA.swell ? synthA.swell.getValue() : 1; },
+    },
+    _isRhythm: synthA._isRhythm,
+    setFreq(f) { synthA.setFreq(f); synthB.setFreq(f); },
+    setRate(r) { if (synthA.setRate) synthA.setRate(r); if (synthB.setRate) synthB.setRate(r); },
+    setPitch(p) { if (synthA.setPitch) synthA.setPitch(p); if (synthB.setPitch) synthB.setPitch(p); },
+    setVol(v) {
+      synthA.setVol(v * wA);
+      synthB.setVol(v * wB);
+    },
+    destroy() { synthA.destroy(); synthB.destroy(); },
+    _isBlend: true,
+  };
+}
+
 function attachSynth(shape) {
   if (shape.synth || shape.isPalette || !masterGain) return;
   if (shape.type === 'darkstar') return; // silent — it absorbs sound
@@ -1226,7 +1254,16 @@ function attachSynth(shape) {
 
   const build = builders[soundPalette][shape.type];
   const isRhythmType = (shape.type === 'square' || shape.type === 'hexagon');
-  synth = build(isRhythmType ? shape : freq);
+
+  // Blend: dual-synth crossfade when paletteBlend is active
+  if (paletteBlend && shape.type !== 'darkstar') {
+    const buildA = builders[paletteBlend.from][shape.type];
+    const buildB = builders[paletteBlend.to][shape.type];
+    const arg = isRhythmType ? shape : freq;
+    synth = buildBlendSynth(buildA, buildB, paletteBlend.ratio, arg);
+  } else {
+    synth = build(isRhythmType ? shape : freq);
+  }
 
   shape.synth = synth;
   synth.setVol(shapeVolume(shape));
@@ -1255,6 +1292,7 @@ function updateShapeAudio(shape) {
 
 function switchSoundPalette() {
   soundPalette = (soundPalette + 1) % PALETTE_NAMES.length;
+  paletteBlend = null; // manual switch clears any singularity blend
   // Tear down all synths and rebuild with new palette
   shapes.forEach(s => detachSynth(s));
   if (masterGain && actx && actx.state === 'running') {
@@ -1788,23 +1826,37 @@ function cancelWarning() {
 
 // Draw warning tendril between two dark stars
 function drawWarningTendril(time) {
-  if (!singStars || singPhase !== 'warning') return;
+  // Draw during warning phase AND during Phase A of collapse (stars merging)
+  if (!singStars) return;
+  if (singPhase !== 'warning' && singPhase !== 'collapse') return;
+
   const dx = singStars[0].x - singStars[1].x;
   const dy = singStars[0].y - singStars[1].y;
   const dist = Math.sqrt(dx * dx + dy * dy);
-  const prox = clamp(1 - (dist - SING_CRIT) / (SING_WARN - SING_CRIT), 0, 1);
-  if (prox < 0.01) return;
+
+  let alpha;
+  if (singPhase === 'warning') {
+    const prox = clamp(1 - (dist - SING_CRIT) / (SING_WARN - SING_CRIT), 0, 1);
+    if (prox < 0.01) return;
+    alpha = prox;
+  } else {
+    // During collapse Phase A: tendril stays visible, fading as stars converge
+    const t = clamp((performance.now() - singTime) / SING_COLLAPSE_MS, 0, 1);
+    const MERGE_T = 0.2;
+    if (t > MERGE_T) return; // gone once Phase B starts
+    alpha = 1 - (t / MERGE_T); // fade out over merge duration
+  }
 
   const x1 = singStars[0].x * W, y1 = singStars[0].y * H;
   const x2 = singStars[1].x * W, y2 = singStars[1].y * H;
   const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-  const wobble = Math.sin(time * 0.003) * 20 * prox;
+  const wobble = Math.sin(time * 0.003) * 20 * alpha;
 
   ctx.save();
-  ctx.strokeStyle = `rgba(180,140,255,${prox * 0.5})`;
-  ctx.lineWidth = 1 + prox * 2;
-  ctx.shadowColor = `rgba(180,140,255,${prox * 0.3})`;
-  ctx.shadowBlur = 10 + prox * 15;
+  ctx.strokeStyle = `rgba(180,140,255,${alpha * 0.5})`;
+  ctx.lineWidth = 1 + alpha * 2;
+  ctx.shadowColor = `rgba(180,140,255,${alpha * 0.3})`;
+  ctx.shadowBlur = 10 + alpha * 15;
   ctx.beginPath();
   ctx.moveTo(x1, y1);
   ctx.quadraticCurveTo(mx + wobble, my - wobble, x2, y2);
@@ -1891,104 +1943,89 @@ function beginCollapse(time) {
 function updateCollapse(elapsed) {
   const t = clamp(elapsed / SING_COLLAPSE_MS, 0, 1);
 
-  // Phase A (0–40%): the two dark stars pull toward each other and merge
-  // Phase A (0–20%): dark stars rush together; Phase B (20–100%): accretion + decay
+  // Phase A (0–20%): dark stars rush together
+  // Shapes begin gentle orbit during merge, accelerating into Phase B
   const MERGE_T = 0.2;
 
-  if (t < MERGE_T) {
-    // Dark stars accelerate toward each other — fast cubic ease-in
+  // --- Dark stars merge ---
+  if (t < MERGE_T && singStars) {
     const mt = t / MERGE_T;
-    const mergeEase = mt * mt * mt; // cubic — slow start, fast finish
-    if (singStars) {
-      singStars.forEach((star, idx) => {
-        const snap = singSnap[star.id];
-        if (!snap) return;
-        star.x = snap.x + (singCenter.x - snap.x) * mergeEase;
-        star.y = snap.y + (singCenter.y - snap.y) * mergeEase;
-        // Shrink slightly as they converge — still visible at merge point
-        star._collapseScale = Math.max(0.4, 1 - mergeEase * 0.6);
-        star.vx = 0; star.vy = 0;
-      });
-    }
-    // Other shapes stay put but start trembling
-    const tremble = mt * mt * 0.003;
-    shapes.forEach(s => {
-      if (s.isPalette || (singStars && singStars.includes(s))) return;
-      const snap = singSnap[s.id];
+    const mergeEase = mt * mt * mt;
+    singStars.forEach((star) => {
+      const snap = singSnap[star.id];
       if (!snap) return;
-      s.x = snap.x + (Math.random() - 0.5) * tremble;
-      s.y = snap.y + (Math.random() - 0.5) * tremble;
+      star.x = snap.x + (singCenter.x - snap.x) * mergeEase;
+      star.y = snap.y + (singCenter.y - snap.y) * mergeEase;
+      star._collapseScale = Math.max(0.4, 1 - mergeEase * 0.6);
+      star.vx = 0; star.vy = 0;
     });
-  } else {
-    // Phase B: singularity formed — accretion disk then orbital decay
-    const bt = (t - MERGE_T) / (1 - MERGE_T); // 0→1 within phase B
+  }
 
-    // Sub-phases: orbit acceleration (0–0.70), then orbital decay (0.70–1)
-    const ORBIT_END = 0.70;
+  // --- All other shapes: continuous orbit from t=0 ---
+  // Smooth orbit (0–76%): one continuous acceleration curve
+  // Decay (76%–100%): orbital collapse to center
+  const ORBIT_END_T = 0.76;
 
-    shapes.forEach(s => {
-      if (s.isPalette) return;
-      const snap = singSnap[s.id];
-      if (!snap) return;
-
-      // Merged dark star — visible during orbit, shrinks during decay
-      if (singStars && singStars.includes(s)) {
+  shapes.forEach(s => {
+    if (s.isPalette) return;
+    const snap = singSnap[s.id];
+    if (!snap) return;
+    if (singStars && singStars.includes(s)) {
+      // Dark stars handled above during merge; after merge, shrink at center
+      if (t >= MERGE_T) {
         s.x = singCenter.x;
         s.y = singCenter.y;
-        if (bt < ORBIT_END) {
-          // Hold at 0.4 scale through the orbit phase — visible singularity core
+        if (t < ORBIT_END_T) {
           s._collapseScale = 0.4;
         } else {
-          // Shrink to point during decay
-          const decayProg = (bt - ORBIT_END) / (1 - ORBIT_END);
+          const decayProg = (t - ORBIT_END_T) / (1 - ORBIT_END_T);
           s._collapseScale = Math.max(0.01, 0.4 * (1 - decayProg * decayProg));
         }
-        return;
       }
+      return;
+    }
 
-      const baseDist = Math.sqrt(
-        Math.pow(snap.x - singCenter.x, 2) + Math.pow(snap.y - singCenter.y, 2)
-      );
-      const baseAngle = Math.atan2(snap.y - singCenter.y, snap.x - singCenter.x);
-      const dir = s.id % 2 ? 1 : -1;
-      const orbitSpeed = 1.8 + (s.id % 5) * 0.7; // radians per normalized time
+    const baseDist = Math.sqrt(
+      Math.pow(snap.x - singCenter.x, 2) + Math.pow(snap.y - singCenter.y, 2)
+    );
+    const baseAngle = Math.atan2(snap.y - singCenter.y, snap.x - singCenter.x);
+    const dir = s.id % 2 ? 1 : -1;
+    const orbitSpeed = 1.8 + (s.id % 5) * 0.7;
 
-      let curDist, angle;
+    let curDist, angle;
 
-      if (bt < ORBIT_END) {
-        // Orbit acceleration: radius holds mostly steady, angular velocity ramps slow→fast
-        const ot = bt / ORBIT_END; // 0→1 within orbit phase
-        // Slight inward drift (down to 85% of original radius)
-        curDist = baseDist * (1 - ot * 0.15);
-        // Cubic ramp — starts very slow, accelerates dramatically toward end
-        const angularProgress = ot * ot * ot;
-        angle = baseAngle + angularProgress * orbitSpeed * 2.2 * dir;
-      } else {
-        // Orbital decay: radius collapses, angular velocity ∝ 1/r²
-        const dt2 = (bt - ORBIT_END) / (1 - ORBIT_END); // 0→1 within decay
-        const decayEase = dt2 * dt2 * dt2; // cubic ease-in — slow start, fast finish
-        // Radius shrinks from 85% down to ~0
-        const startR = baseDist * 0.85;
-        curDist = startR * Math.max(0.01, 1 - decayEase);
-        // Continue from orbit-end speed and accelerate with shrinking radius
-        const orbitEndAngle = baseAngle + 1.0 * orbitSpeed * 2.2 * dir;
-        const rRatio = startR / Math.max(curDist, 0.001);
-        // Integrate angular displacement — use smooth approximation
-        const decayRotation = orbitSpeed * 3 * dir * (dt2 + dt2 * dt2 + dt2 * dt2 * dt2) / 3;
-        angle = orbitEndAngle + decayRotation * Math.min(rRatio, 8);
-      }
+    if (t < ORBIT_END_T) {
+      // Single smooth orbit curve — no phase boundary
+      const ot = t / ORBIT_END_T; // 0→1 over entire orbit period
+      curDist = baseDist * (1 - ot * 0.15); // gentle inward drift to 85%
+      // Quartic ramp — even slower start, more dramatic acceleration at end
+      const angularProgress = ot * ot * ot * ot;
+      angle = baseAngle + angularProgress * orbitSpeed * 2.5 * dir;
+    } else {
+      // Orbital decay: radius collapses fast, angular velocity ∝ 1/r
+      const dt2 = (t - ORBIT_END_T) / (1 - ORBIT_END_T); // 0→1
+      // Quartic ease-in — very fast collapse
+      const decayEase = dt2 * dt2 * dt2 * dt2;
+      const startR = baseDist * 0.85;
+      curDist = startR * Math.max(0.01, 1 - decayEase);
+      const orbitEndAngle = baseAngle + 1.0 * orbitSpeed * 2.5 * dir;
+      const rRatio = startR / Math.max(curDist, 0.001);
+      const decayRotation = orbitSpeed * 4 * dir * (dt2 + dt2 * dt2 + dt2 * dt2 * dt2) / 3;
+      angle = orbitEndAngle + decayRotation * Math.min(rRatio, 10);
+    }
 
-      s.x = singCenter.x + Math.cos(angle) * curDist;
-      s.y = singCenter.y + Math.sin(angle) * curDist;
-      s.vx = 0; s.vy = 0;
+    s.x = singCenter.x + Math.cos(angle) * curDist;
+    s.y = singCenter.y + Math.sin(angle) * curDist;
+    s.vx = 0; s.vy = 0;
 
-      // Scale: stays ~1 during orbit, shrinks during decay
-      const overallEase = bt * bt * bt;
-      s._collapseScale = bt < ORBIT_END ? (1 - bt * 0.1) : Math.max(0.05, 1 - overallEase * 0.9);
-    });
+    // Scale: gentle during orbit, shrinks during decay
+    const overallEase = t * t * t;
+    s._collapseScale = t < ORBIT_END_T ? (1 - t * 0.08) : Math.max(0.05, 1 - overallEase * 0.9);
+  });
 
-    // Fade audio — hold full during orbit phase, fade during decay
-    const decayT = bt < ORBIT_END ? 0 : (bt - ORBIT_END) / (1 - ORBIT_END);
+  // Fade audio during decay phase
+  if (t >= ORBIT_END_T) {
+    const decayT = (t - ORBIT_END_T) / (1 - ORBIT_END_T);
     const audioFade = 1 - decayT * decayT;
     shapes.forEach(s => {
       if (s.isPalette || !s.synth) return;
@@ -2103,9 +2140,12 @@ function applyTransformation() {
   // Add scar
   singScars.push({ x: singCenter.x, y: singCenter.y, birth: performance.now() });
 
-  // Rotate sound palette — new synths will build with the next palette
+  // Rotate sound palette and set up blend for circles
   // Old synths are already detached (void phase), so no teardown needed
+  const prevPalette = soundPalette;
   soundPalette = (soundPalette + 1) % PALETTE_NAMES.length;
+  // Blend: random ratio between 30-70% of the new palette
+  paletteBlend = { from: prevPalette, to: soundPalette, ratio: 0.3 + Math.random() * 0.4 };
   // Rebuild table surface to update compass label
   buildTable();
 }
@@ -2237,8 +2277,11 @@ function updateExpand(elapsed) {
         attachSynth(s);
         if (s.synth) {
           s.synth.setVol(0.001);
-          // Pause swell immediately — we control volume during expansion/settle
-          if (s.synth.swell) s.synth.swell.pause();
+          // Tick swell once to set envelope gain to peak, then pause
+          if (s.synth.swell) {
+            s.synth.swell.tick();
+            s.synth.swell.pause();
+          }
         }
       }
     });
@@ -2433,7 +2476,7 @@ function currentBgColor() {
     // BG stays normal during merge + orbit, fades to black during orbital decay
     const t = clamp((performance.now() - singTime) / SING_COLLAPSE_MS, 0, 1);
     const base = singCount > 0 ? singularityBgColor(singCount) : BG_BASE;
-    const MERGE_T = 0.2, ORBIT_END_T = 0.2 + 0.8 * 0.70; // match Phase A + orbit portion of B
+    const MERGE_T = 0.2, ORBIT_END_T = 0.76; // match collapse phases
     const darkT = clamp((t - ORBIT_END_T) / (1 - ORBIT_END_T), 0, 1); // 0 during orbit, 0→1 during decay
     return lerpColor(base, [0, 0, 0], darkT);
   }
