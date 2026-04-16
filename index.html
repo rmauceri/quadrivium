@@ -55,7 +55,7 @@ const SING_CRIT    = 0.12;   // normalized distance: dark stars merge
 const SING_WARN    = 0.36;   // 3× critical — warning begins
 const GOLDEN_ANGLE = 0.381966;  // 137.508° / 360° — never-repeating hue rotation
 const SING_COLLAPSE_MS = 4200;
-const SING_VOID_MS     = 1500;
+const SING_VOID_MS     = 2200;
 const SING_EXPAND_MS   = 2500;
 const SING_SETTLE_MS   = 1500;
 const MIN_HIT     = 44;
@@ -2094,15 +2094,16 @@ function beginVoid(time) {
 function updateVoid(elapsed) {
   const t = clamp(elapsed / SING_VOID_MS, 0, 1);
 
-  // Bright pulse at midpoint
-  if (t > 0.3 && t < 0.7) {
-    singPulse = 1 - Math.abs(t - 0.5) / 0.2;
+  // Bright pulse — wider window, slower fade
+  if (t > 0.2 && t < 0.85) {
+    const peak = 0.45; // pulse peaks slightly before midpoint
+    singPulse = clamp(1 - Math.abs(t - peak) / 0.35, 0, 1);
   } else {
     singPulse = 0;
   }
 
-  // Void complete → apply transformation and begin expansion
-  if (t >= 1) {
+  // Begin expansion while flash still glows — shapes emerge from light
+  if (t >= 0.65 && singPhase === 'void') {
     applyTransformation();
     beginExpansion(performance.now());
   }
@@ -2252,7 +2253,8 @@ function beginExpansion(time) {
 
 function updateExpand(elapsed) {
   const t = clamp(elapsed / SING_EXPAND_MS, 0, 1);
-  const ease = 1 - Math.pow(1 - t, 3); // cubic ease-out — explosive then decelerating
+  // Quartic ease-out — punchy burst then gentle decel
+  const ease = 1 - Math.pow(1 - t, 4);
 
   shapes.forEach(s => {
     if (s.isPalette) return;
@@ -2263,11 +2265,11 @@ function updateExpand(elapsed) {
     s.x = singCenter.x + (target.x - singCenter.x) * ease;
     s.y = singCenter.y + (target.y - singCenter.y) * ease;
 
-    // Scale up
-    s._collapseScale = ease;
+    // Scale up — start at 15% so shapes are immediately visible
+    s._collapseScale = 0.15 + 0.85 * ease;
 
-    // Fade in
-    s.opacity = clamp(ease * 1.5, 0, 1);
+    // Fade in — immediate partial visibility
+    s.opacity = clamp(0.3 + ease * 0.7, 0, 1);
     s.fadeTarget = 1;
   });
 
@@ -2393,15 +2395,19 @@ function updateSingularity(time) {
 
 // Draw singularity visual effects (void pulse, ripple ring, scars)
 function drawSingularityFx(time) {
-  // Bright pulse during void
-  if (singPhase === 'void' && singPulse > 0 && singCenter) {
-    const r = singPulse * 60;
+  // Bright pulse during void, lingering into early expansion
+  if (singPulse > 0 && singCenter && (singPhase === 'void' || singPhase === 'expand')) {
+    const alpha = singPhase === 'expand'
+      ? singPulse * Math.max(0, 1 - clamp((performance.now() - singTime) / 600, 0, 1))
+      : singPulse;
+    if (alpha > 0.01) {
+      const r = alpha * 60;
     const grad = ctx.createRadialGradient(
       singCenter.x * W, singCenter.y * H, 0,
       singCenter.x * W, singCenter.y * H, r
     );
-    grad.addColorStop(0, `rgba(255,255,255,${singPulse * 0.9})`);
-    grad.addColorStop(0.4, `rgba(200,180,255,${singPulse * 0.4})`);
+    grad.addColorStop(0, `rgba(255,255,255,${alpha * 0.9})`);
+    grad.addColorStop(0.4, `rgba(200,180,255,${alpha * 0.4})`);
     grad.addColorStop(1, `rgba(180,140,255,0)`);
     ctx.save();
     ctx.fillStyle = grad;
@@ -2409,6 +2415,7 @@ function drawSingularityFx(time) {
     ctx.arc(singCenter.x * W, singCenter.y * H, r, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
+    }
   }
 
   // Ripple rings from scars (expanding for 12s, then faint permanent mark)
@@ -2477,9 +2484,9 @@ function currentBgColor() {
     // BG stays normal during merge + orbit, fades to black during orbital decay
     const t = clamp((performance.now() - singTime) / SING_COLLAPSE_MS, 0, 1);
     const base = singCount > 0 ? singularityBgColor(singCount) : BG_BASE;
-    const MERGE_T = 0.2, ORBIT_END_T = 0.76; // match collapse phases
-    const darkT = clamp((t - ORBIT_END_T) / (1 - ORBIT_END_T), 0, 1); // 0 during orbit, 0→1 during decay
-    return lerpColor(base, [0, 0, 0], darkT);
+    const MERGE_T = 0.2, FADE_START = 0.90; // BG darkens only in final 10%
+    const darkT = clamp((t - FADE_START) / (1 - FADE_START), 0, 1);
+    return lerpColor(base, [0, 0, 0], darkT * darkT); // quadratic snap to black
   }
   if (singPhase === 'expand' && singBgTo) {
     // Transition from black → new BG during expansion
